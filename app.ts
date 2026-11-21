@@ -103,10 +103,14 @@ export function createApp(): Server {
       const body = await readBody(req);
       const gitProtocol = req.headers['git-protocol']?.toString() ?? '';
       const isV2 = gitProtocol.includes('version=2');
+      // For GET /info/refs the service comes from ?service=; for POST it is the last path segment.
+      const serviceParam = method === 'GET'
+        ? (query.get('service') === 'git-receive-pack' ? 'git-receive-pack' : 'git-upload-pack')
+        : (url.pathname.endsWith('git-receive-pack') ? 'git-receive-pack' : 'git-upload-pack');
       try {
         const result = await handleGitRequest({
           repo,
-          service: url.pathname.endsWith('git-receive-pack') ? 'git-receive-pack' : 'git-upload-pack',
+          service: serviceParam,
           method,
           query,
           body,
@@ -136,35 +140,9 @@ export function createApp(): Server {
 
     const url = parseUrl(req);
     const body = await readBody(req);
-    let parsedBody: unknown;
-    try {
-      parsedBody = parseJsonBody(body);
-    } catch {
-      sendError(res, 400, 'Problems parsing JSON');
-      return;
-    }
-
     const baseUrl = `${url.protocol}//${url.host}`;
 
-    // GraphQL: /api/graphql
-    if (url.pathname === '/api/graphql') {
-      try {
-        // Check if batched (array body)
-        if (Array.isArray(parsedBody)) {
-          const results = await handleGraphQLBatch(parsedBody as Array<{ query: string; variables?: Record<string, unknown> }>, store, viewer.login);
-          sendJson(res, 200, results);
-        } else {
-          const result = await handleGraphQL(parsedBody as { query: string; variables?: Record<string, unknown> }, store, viewer.login, baseUrl);
-          const status = result.errors ? 200 : 200;
-          sendJson(res, status, result);
-        }
-      } catch (e) {
-        sendError(res, 500, `Internal Server Error: ${(e as Error).message}`);
-      }
-      return;
-    }
-
-    // MCP: /mcp
+    // MCP: /mcp — gets the RAW body so a malformed body becomes JSON-RPC -32700 (HTTP 400)
     if (url.pathname === '/mcp') {
       try {
         const result = await handleMCP({
@@ -184,6 +162,33 @@ export function createApp(): Server {
           ...result.headers,
         });
         res.end(result.body);
+      } catch (e) {
+        sendError(res, 500, `Internal Server Error: ${(e as Error).message}`);
+      }
+      return;
+    }
+
+    // Everything else parses JSON; malformed body is a 400.
+    let parsedBody: unknown;
+    try {
+      parsedBody = parseJsonBody(body);
+    } catch {
+      sendError(res, 400, 'Problems parsing JSON');
+      return;
+    }
+
+    // GraphQL: /api/graphql
+    if (url.pathname === '/api/graphql') {
+      try {
+        // Check if batched (array body)
+        if (Array.isArray(parsedBody)) {
+          const results = await handleGraphQLBatch(parsedBody as Array<{ query: string; variables?: Record<string, unknown> }>, store, viewer.login);
+          sendJson(res, 200, results);
+        } else {
+          const result = await handleGraphQL(parsedBody as { query: string; variables?: Record<string, unknown> }, store, viewer.login, baseUrl);
+          const status = result.errors ? 200 : 200;
+          sendJson(res, status, result);
+        }
       } catch (e) {
         sendError(res, 500, `Internal Server Error: ${(e as Error).message}`);
       }

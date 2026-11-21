@@ -3,6 +3,7 @@
 
 import type { Store, Repo, Issue, Pull, PullFile, GitObjectType } from './store.ts';
 import { isObjectId } from './store.ts';
+import { mergePullRequest } from './rest.ts';
 
 export interface GraphQLRequest {
   query: string;
@@ -61,7 +62,7 @@ function tokenize(input: string): Token[] {
       const startLine = line, startCol = col; let val = ''; while (isNameCont(peek())) { val += peek(); advance(); }
       tokens.push({ type: KEYWORDS.has(val) ? 'NAME' : 'NAME', value: val, line: startLine, col: startCol }); continue;
     }
-    if (c === ':' || c === '(' || c === ')' || c === '[' || c === ']' || c === '{' || c === '}' || c === ',' || c === '=' || c === '@') {
+    if (c === ':' || c === '!' || c === '(' || c === ')' || c === '[' || c === ']' || c === '{' || c === '}' || c === ',' || c === '=' || c === '@' || c === '|' || c === '&') {
       const startLine = line, startCol = col; let val = c; advance(); if (c === '.' && peek() === '.' && input[i + 1] === '.') { val = '...'; advance(3); tokens.push({ type: 'SPREAD', value: '...', line: startLine, col: startCol }); continue; }
       tokens.push({ type: 'PUNCTUATION', value: val, line: startLine, col: startCol }); continue;
     }
@@ -128,7 +129,8 @@ function createParser(tokens: Token[]): Parser {
     throw new Error(`Unexpected value token ${tok.type} ${tok.value} at ${tok.line}:${tok.col}`);
   };
   const parseArgument = (): ArgumentNode => { const name = expect('NAME').value; eat('PUNCTUATION', ':'); return { kind: 'Argument', name, value: parseValue() }; };
-  const parseArguments = (): ArgumentNode[] => { if (peek().type !== 'PUNCTUATION' || peek().value !== '(') return []; eat('PUNCTUATION', '('); const args: ArgumentNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== ')') args.push(parseArgument()); eat('PUNCTUATION', ')'); return args; };
+  const skipCommas = (): void => { while (peek().type === 'PUNCTUATION' && peek().value === ',') pos += 1; };
+  const parseArguments = (): ArgumentNode[] => { if (peek().type !== 'PUNCTUATION' || peek().value !== '(') return []; eat('PUNCTUATION', '('); const args: ArgumentNode[] = []; for (skipCommas(); !(peek().type === 'PUNCTUATION' && peek().value === ')'); skipCommas()) args.push(parseArgument()); eat('PUNCTUATION', ')'); return args; };
   const parseDirective = (): DirectiveNode => { eat('PUNCTUATION', '@'); const name = expect('NAME').value; return { kind: 'Directive', name, arguments: parseArguments() }; };
   const parseDirectives = (): DirectiveNode[] => { const dirs: DirectiveNode[] = []; while (peek().type === 'PUNCTUATION' && peek().value === '@') dirs.push(parseDirective()); return dirs; };
   const parseField = (): FieldNode => {
@@ -138,11 +140,11 @@ function createParser(tokens: Token[]): Parser {
     if (peek().type === 'PUNCTUATION' && peek().value === '{') { eat('PUNCTUATION', '{'); selectionSet = parseSelectionSet(); eat('PUNCTUATION', '}'); }
     return { kind: 'Field', alias, name, arguments: args, directives: dirs, selectionSet };
   };
-  const parseSelectionSet = (): SelectionNode[] => { const sels: SelectionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== '}') { if (peek().type === 'PUNCTUATION' && peek().value === '...') { const tok = peek(1); if (tok.type === 'NAME' && tok.value === 'on') { sels.push(parseInlineFragment()); } else { sels.push(parseFragmentSpread()); } } else { sels.push(parseField()); } } return sels; };
+  const parseSelectionSet = (): SelectionNode[] => { const sels: SelectionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== '}') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } if (peek().type === 'PUNCTUATION' && peek().value === '...') { const tok = peek(1); if (tok.type === 'NAME' && tok.value === 'on') { sels.push(parseInlineFragment()); } else { sels.push(parseFragmentSpread()); } } else { sels.push(parseField()); } } return sels; };
   const parseFragmentSpread = (): FragmentSpreadNode => { eat('SPREAD'); const name = expect('NAME').value; return { kind: 'FragmentSpread', name, directives: parseDirectives() }; };
   const parseInlineFragment = (): InlineFragmentNode => { eat('SPREAD'); eat('NAME', 'on'); const typeCondition = expect('NAME').value; return { kind: 'InlineFragment', typeCondition, directives: parseDirectives(), selectionSet: parseSelectionSet() }; };
   const parseVariableDefinition = (): VariableDefinitionNode => { const name = expect('VARIABLE').value; eat('PUNCTUATION', ':'); const type = parseType(); let defaultValue: ValueNode | undefined; if (peek().type === 'PUNCTUATION' && peek().value === '=') { eat('PUNCTUATION', '='); defaultValue = parseValue(); } return { kind: 'VariableDefinition', name, type, defaultValue, directives: [] }; };
-  const parseVariableDefinitions = (): VariableDefinitionNode[] => { if (peek().type !== 'PUNCTUATION' || peek().value !== '(') return []; eat('PUNCTUATION', '('); const defs: VariableDefinitionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== ')') defs.push(parseVariableDefinition()); eat('PUNCTUATION', ')'); return defs; };
+  const parseVariableDefinitions = (): VariableDefinitionNode[] => { if (peek().type !== 'PUNCTUATION' || peek().value !== '(') return []; eat('PUNCTUATION', '('); const defs: VariableDefinitionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== ')') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } defs.push(parseVariableDefinition()); } eat('PUNCTUATION', ')'); return defs; };
   const parseOperation = (): OperationDefinitionNode => {
     let operation: OperationDefinitionNode['operation'] = 'query';
     if (peek().type === 'NAME' && (peek().value === 'query' || peek().value === 'mutation')) { operation = eat('NAME').value as any; }
@@ -204,9 +206,14 @@ function decodeGlobalId(id: string): { type: string; id: string } | null {
 }
 
 const schemaTypes = new Map<string, GqlType>();
+const enumTypes = new Map<string, string[]>();
 
 function defineType(name: string, fields: Record<string, FieldResolver>) {
   schemaTypes.set(name, { name, fields: new Map(Object.entries(fields)) });
+}
+
+function defineEnum(name: string, values: readonly string[]) {
+  enumTypes.set(name, [...values]);
 }
 
 // -------- Scalar/Enum resolvers (handled by value coercion)
@@ -242,8 +249,10 @@ defineType('Query', {
   __type: (_s, args) => {
     const name = String(args.name);
     const type = schemaTypes.get(name);
-    if (!type) return null;
-    return { __typename: '__Type', type };
+    if (type) return { __typename: '__Type', type };
+    const values = enumTypes.get(name);
+    if (values) return { __typename: '__Type', enumTypeName: name, enumValuesList: values };
+    return null;
   },
 });
 
@@ -371,22 +380,19 @@ defineType('PullRequestConnection', {
 defineType('Ref', { name: (s) => (s as any).name });
 
 defineType('__Type', {
-  name: (s) => (s as any).type.name,
-  fields: (s, args) => {
-    const type = (s as any).type as GqlType;
+  name: (s) => (s as any).type?.name ?? (s as any).enumTypeName ?? null,
+  fields: (s) => {
+    const type = (s as any).type as GqlType | undefined;
+    if (!type) return [];
     return [...type.fields.keys()].map(name => ({ __typename: '__Field', name }));
   },
-  enumValues: (s, args) => {
-    const type = (s as any).type as GqlType;
-    if (type.name === 'SearchType') return [...Object.values(SearchType)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'IssueState') return [...Object.values(IssueState)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'PullRequestState') return [...Object.values(PullRequestState)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'MergeableState') return [...Object.values(MergeableState)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'PullRequestMergeMethod') return [...Object.values(PullRequestMergeMethod)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'RepositoryPermission') return [...Object.values(RepositoryPermission)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'IssueOrderField') return [...Object.values(IssueOrderField)].map(name => ({ __typename: '__EnumValue', name }));
-    if (type.name === 'OrderDirection') return [...Object.values(OrderDirection)].map(name => ({ __typename: '__EnumValue', name }));
-    return [];
+  enumValues: (s) => {
+    const list = (s as any).enumValuesList as string[] | undefined;
+    if (list) return list.map(name => ({ __typename: '__EnumValue', name }));
+    const type = (s as any).type as GqlType | undefined;
+    if (!type) return [];
+    const values = enumTypes.get(type.name);
+    return (values ?? []).map(name => ({ __typename: '__EnumValue', name }));
   },
 });
 
@@ -413,9 +419,8 @@ defineType('Mutation', {
     const issueId = String(input.issueId);
     const decoded = decodeGlobalId(issueId);
     if (!decoded || decoded.type !== 'Issue') throw new Error('Bad issue id');
-    // find issue by global id
     for (const repo of ctx.store.repos.values()) {
-      const issue = repo.issueByNumber(Number(decoded.id));
+      const issue = repo.issues.find((candidate) => String(candidate.id) === decoded.id);
       if (issue && globalId('Issue', String(issue.id)) === issueId) {
         issue.state = 'closed';
         issue.closedAt = repo.iso();
@@ -452,13 +457,10 @@ defineType('Mutation', {
     const decoded = decodeGlobalId(pullId);
     if (!decoded || decoded.type !== 'PullRequest') throw new Error('Bad pull id');
     for (const repo of ctx.store.repos.values()) {
-      const pull = repo.pullByNumber(Number(decoded.id));
+      const pull = repo.pulls.find((candidate) => String(candidate.id) === decoded.id);
       if (pull && globalId('PullRequest', String(pull.id)) === pullId) {
-        const result = repo.isAncestor(pull.baseSha, pull.headSha) ? { ok: true as const, sha: '' } : { ok: false as const, reason: 'non-fast-forward' };
-        if (!result.ok) throw new Error('Pull Request is not mergeable');
-        const mergeCommit = `merge_${pull.id}_${Date.now()}`;
-        repo.refs.set(`refs/heads/${pull.baseRef}`, mergeCommit);
-        pull.merged = true; pull.state = 'closed'; pull.mergedAt = repo.iso(); pull.mergeCommitSha = mergeCommit; pull.closedAt = pull.mergedAt;
+        const result = mergePullRequest(repo, pull);
+        if (!result.ok) throw new Error(result.message);
         return { __typename: 'MergePullRequestPayload', pullRequest: { __typename: 'PullRequest', pull, repo } };
       }
     }
@@ -470,7 +472,7 @@ defineType('Mutation', {
     const decoded = decodeGlobalId(subjectId);
     if (!decoded || decoded.type !== 'Issue') throw new Error('Bad subject id');
     for (const repo of ctx.store.repos.values()) {
-      const issue = repo.issueByNumber(Number(decoded.id));
+      const issue = repo.issues.find((candidate) => String(candidate.id) === decoded.id);
       if (issue && globalId('Issue', String(issue.id)) === subjectId) {
         repo.tick();
         const comment = { id: 70_000 + ++repo.commentSeq, body: String(input.body), createdAt: repo.iso(), updatedAt: repo.iso() };
@@ -491,33 +493,32 @@ defineType('AddCommentPayload', { commentEdge: (s) => (s as any).commentEdge });
 defineType('CommentEdge', { node: (s) => (s as any).node });
 defineType('Comment', { id: (s) => (s as any).id, body: (s) => (s as any).body });
 
+// Enum types (introspection: __type(name).enumValues)
+defineEnum('SearchType', Object.values(SearchType));
+defineEnum('IssueState', Object.values(IssueState));
+defineEnum('PullRequestState', Object.values(PullRequestState));
+defineEnum('MergeableState', Object.values(MergeableState));
+defineEnum('PullRequestMergeMethod', Object.values(PullRequestMergeMethod));
+defineEnum('RepositoryPermission', Object.values(RepositoryPermission));
+defineEnum('IssueOrderField', Object.values(IssueOrderField));
+defineEnum('OrderDirection', Object.values(OrderDirection));
+
 // ================================================================ Executor
 
-function coerceValue(typeName: string, value: unknown): unknown {
-  // GraphQL input coercion — minimal, variables already coerced by client
-  return value;
-}
-
-function getVariableValue(vars: Record<string, unknown>, name: string, type?: TypeNode, def?: ValueNode): unknown {
-  if (name in vars) return vars[name];
-  if (def !== undefined) return valueFromAst(def);
-  throw new Error(`Variable $${name} not provided`);
-}
-
-function valueFromAst(node: ValueNode): unknown {
+function valueFromAst(node: ValueNode, vars: Record<string, unknown>): unknown {
   switch (node.kind) {
     case 'IntValue': case 'FloatValue': return node.value;
     case 'StringValue': return node.value;
     case 'BooleanValue': return node.value;
     case 'NullValue': return null;
     case 'EnumValue': return node.value;
-    case 'ListValue': return node.values.map(valueFromAst);
+    case 'Variable': return Object.prototype.hasOwnProperty.call(vars, node.name) ? vars[node.name] : undefined;
+    case 'ListValue': return node.values.map((v) => valueFromAst(v, vars));
     case 'ObjectValue': {
       const obj: Record<string, unknown> = {};
-      for (const f of node.fields) obj[f.name] = valueFromAst(f.value);
+      for (const f of node.fields) obj[f.name] = valueFromAst(f.value, vars);
       return obj;
     }
-    case 'Variable': throw new Error('Variable in value position');
   }
 }
 
@@ -534,13 +535,12 @@ function resolveField(
   if (!resolver) { errors.push({ message: `Field '${field.name}' does not exist on type '${typeName}'` }); return null; }
   const args: Record<string, unknown> = {};
   for (const arg of field.arguments) {
-    const val = valueFromAst(arg.value);
-    args[arg.name] = val;
+    const val = valueFromAst(arg.value, context.variables);
+    if (val !== undefined) args[arg.name] = val;
   }
   try {
     const result = resolver(source, args, context);
     if (result === null || result === undefined) return null;
-    // If field has sub-selection, recurse
     if (field.selectionSet && field.selectionSet.length > 0) {
       return executeSelectionSet(result, field.selectionSet, context, errors);
     }
@@ -566,10 +566,7 @@ function executeSelectionSet(
     if (sel.kind === 'Field') {
       const key = sel.alias ?? sel.name;
       out[key] = resolveField(source, sel, context, errors);
-    } else if (sel.kind === 'FragmentSpread') {
-      // Not used in our queries
     } else if (sel.kind === 'InlineFragment') {
-      // Type condition check
       const typeName = (source as any).__typename;
       if (typeName === sel.typeCondition) {
         const res = executeSelectionSet(source, sel.selectionSet, context, errors);
@@ -586,13 +583,13 @@ function executeOperation(
   context: GqlContext,
 ): { data?: unknown; errors?: Array<{ message: string }> } {
   const errors: Array<{ message: string }> = [];
-  // Build merged variable map with defaults
   const mergedVars: Record<string, unknown> = { ...variables };
   for (const def of op.variableDefinitions) {
-    const val = getVariableValue(mergedVars, def.name, def.type, def.defaultValue);
-    if (val !== undefined) mergedVars[def.name] = val;
+    if (!(def.name in mergedVars) && def.defaultValue !== undefined) {
+      mergedVars[def.name] = valueFromAst(def.defaultValue, mergedVars);
+    }
   }
-  const ctx = { ...context, variables: mergedVars };
+  const ctx: GqlContext = { ...context, variables: mergedVars };
   const data = executeSelectionSet({ __typename: op.operation === 'query' ? 'Query' : 'Mutation' }, op.selectionSet, ctx, errors);
   if (errors.length > 0) return { data: null, errors };
   return { data };

@@ -24,6 +24,8 @@ function assert(cond: boolean, msg: string): void {
   console.log(`  OK: ${msg}`);
 }
 
+let VIEWER = 'adaiversen';
+
 async function testRest() {
   console.log('\n=== REST v3 ===');
   
@@ -43,6 +45,7 @@ async function testRest() {
   assert(r.status === 200, 'GET /api/v3/user 200');
   const viewerLogin = (r.body as any).login;
   assert(viewerLogin, 'viewer login');
+  VIEWER = viewerLogin;
   console.log(`  viewer: ${viewerLogin}`);
 
   // Create repo
@@ -208,20 +211,20 @@ async function testGraphQL() {
   });
   assert(r.status === 201, 'REST create repo for GraphQL');
 
-  // viewer login
+  // VIEWER login
   r = await fetchJson(`${BASE}/api/graphql`, {
     method: 'POST',
     body: JSON.stringify({ query: 'query { viewer { login } }' }),
   });
-  assert(r.status === 200, 'GraphQL viewer login');
-  assert((r.body as any).data?.viewer?.login, 'viewer.login returned');
+  assert(r.status === 200, 'GraphQL VIEWER login');
+  assert((r.body as any).data?.viewer?.login, 'VIEWER.login returned');
 
   // repository fields
   r = await fetchJson(`${BASE}/api/graphql`, {
     method: 'POST',
     body: JSON.stringify({
       query: `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id databaseId name owner { login } defaultBranchRef { name } viewerPermission hasIssuesEnabled } }`,
-      variables: { owner: viewer, name: repoName },
+      variables: { owner: VIEWER, name: repoName },
     }),
   });
   assert(r.status === 200, 'GraphQL repository fields');
@@ -254,7 +257,7 @@ async function testGraphQL() {
     method: 'POST',
     body: JSON.stringify({
       query: `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id databaseId } }`,
-      variables: { owner: viewer, name: repoName },
+      variables: { owner: VIEWER, name: repoName },
     }),
   });
   assert(r.status === 200, 'GraphQL repo id lookup');
@@ -275,7 +278,7 @@ async function testGraphQL() {
   assert(gqlIssueNumber >= 1, 'created issue number');
 
   // REST reads the GraphQL-created issue back
-  r = await fetchJson(`${BASE}/api/v3/repos/${viewer}/${repoName}/issues/${gqlIssueNumber}`);
+  r = await fetchJson(`${BASE}/api/v3/repos/${VIEWER}/${repoName}/issues/${gqlIssueNumber}`);
   assert(r.status === 200, 'REST reads GraphQL issue');
   assert((r.body as any).title === 'GraphQL Issue', 'same title over REST');
 
@@ -284,7 +287,7 @@ async function testGraphQL() {
     method: 'POST',
     body: JSON.stringify({
       query: `query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id } } }`,
-      variables: { owner: viewer, name: repoName, number: gqlIssueNumber },
+      variables: { owner: VIEWER, name: repoName, number: gqlIssueNumber },
     }),
   });
   const issueGid = (r.body as any).data?.repository?.issue?.id;
@@ -326,7 +329,7 @@ async function testGraphQL() {
   assert(r2.status === 401, 'GraphQL unauth 401');
 
   // Cleanup
-  await fetchJson(`${BASE}/api/v3/repos/${viewer}/${repoName}`, { method: 'DELETE' });
+  await fetchJson(`${BASE}/api/v3/repos/${VIEWER}/${repoName}`, { method: 'DELETE' });
 }
 
 async function testMCP() {
@@ -374,21 +377,21 @@ async function testMCP() {
   // get_repo
   r = await fetchJson(`${BASE}/mcp`, {
     method: 'POST',
-    body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'get_repo', arguments: { owner: viewer, repo: repoName } } }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'get_repo', arguments: { owner: VIEWER, repo: repoName } } }),
   });
   assert(r.status === 200, 'MCP get_repo 200');
 
   // create_issue
   r = await fetchJson(`${BASE}/mcp`, {
     method: 'POST',
-    body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'create_issue', arguments: { owner: viewer, repo: repoName, title: 'MCP Issue', body: 'body' } } }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'create_issue', arguments: { owner: VIEWER, repo: repoName, title: 'MCP Issue', body: 'body' } } }),
   });
   assert(r.status === 200, 'MCP create_issue 200');
 
   // list_issues
   r = await fetchJson(`${BASE}/mcp`, {
     method: 'POST',
-    body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_issues', arguments: { owner: viewer, repo: repoName, state: 'open' } } }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'list_issues', arguments: { owner: VIEWER, repo: repoName, state: 'open' } } }),
   });
   assert(r.status === 200, 'MCP list_issues 200');
 
@@ -426,7 +429,7 @@ async function testMCP() {
   assert(r3.status === 401, 'no auth 401');
 
   // Cleanup
-  await fetchJson(`${BASE}/api/v3/repos/${viewer}/${repoName}`, { method: 'DELETE' });
+  await fetchJson(`${BASE}/api/v3/repos/${VIEWER}/${repoName}`, { method: 'DELETE' });
 }
 
 async function testGit() {
@@ -441,40 +444,47 @@ async function testGit() {
   assert(r.status === 201, 'REST create repo for Git');
 
   // v2 info/refs upload-pack
-  const r2 = await fetch(`${BASE}/${viewer}/${repoName}.git/info/refs?service=git-upload-pack`, {
+  const r2 = await fetch(`${BASE}/${VIEWER}/${repoName}.git/info/refs?service=git-upload-pack`, {
     headers: { authorization: `Bearer ${TOKEN}`, 'git-protocol': 'version=2' },
   });
   assert(r2.status === 200, 'Git v2 info/refs 200');
   assert(r2.headers.get('content-type')?.includes('application/x-git-upload-pack-advertisement'), 'v2 content-type');
   const text = await r2.text();
-  assert(text.startsWith('version 2'), 'v2 advertisement starts with version 2');
+  // The advertisement is pkt-line framed: 4 hex length chars then the payload.
+  const firstPktPayload = (() => {
+    const len = parseInt(text.slice(0, 4), 16);
+    return len > 4 ? text.slice(4, len) : '';
+  })();
+  assert(firstPktPayload === 'version 2\n', `v2 advertisement first pkt is "version 2" (got ${JSON.stringify(firstPktPayload)})`);
   assert(text.includes('ls-refs') && text.includes('fetch'), 'v2 caps');
 
   // v0 info/refs upload-pack
-  const r3 = await fetch(`${BASE}/${viewer}/${repoName}.git/info/refs?service=git-upload-pack`, {
+  const r3 = await fetch(`${BASE}/${VIEWER}/${repoName}.git/info/refs?service=git-upload-pack`, {
     headers: { authorization: `Bearer ${TOKEN}` },
   });
   assert(r3.status === 200, 'Git v0 info/refs 200');
   const text3 = await r3.text();
-  assert(text3.startsWith('# service=git-upload-pack'), 'v0 preamble');
+  const v0First = (() => { const len = parseInt(text3.slice(0, 4), 16); return len > 4 ? text3.slice(4, len) : ''; })();
+  assert(v0First === '# service=git-upload-pack\n', 'v0 preamble');
 
   // receive-pack advertisement
-  const r4 = await fetch(`${BASE}/${viewer}/${repoName}.git/info/refs?service=git-receive-pack`, {
+  const r4 = await fetch(`${BASE}/${VIEWER}/${repoName}.git/info/refs?service=git-receive-pack`, {
     headers: { authorization: `Bearer ${TOKEN}` },
   });
   assert(r4.status === 200, 'receive-pack info/refs 200');
   const text4 = await r4.text();
-  assert(text4.startsWith('# service=git-receive-pack'), 'receive-pack preamble');
+  const rpFirst = (() => { const len = parseInt(text4.slice(0, 4), 16); return len > 4 ? text4.slice(4, len) : ''; })();
+  assert(rpFirst === '# service=git-receive-pack\n', 'receive-pack preamble');
   assert(text4.includes('report-status') && text4.includes('side-band-64k') && text4.includes('delete-refs'), 'receive-pack caps');
 
   // Missing repo 404
-  const r5 = await fetch(`${BASE}/${viewer}/nonexistent.git/info/refs?service=git-upload-pack`, {
+  const r5 = await fetch(`${BASE}/${VIEWER}/nonexistent.git/info/refs?service=git-upload-pack`, {
     headers: { authorization: `Bearer ${TOKEN}` },
   });
   assert(r5.status === 404, 'missing repo 404');
 
   // Cleanup
-  await fetchJson(`${BASE}/api/v3/repos/${viewer}/${repoName}`, { method: 'DELETE' });
+  await fetchJson(`${BASE}/api/v3/repos/${VIEWER}/${repoName}`, { method: 'DELETE' });
 }
 
 async function testAuth() {

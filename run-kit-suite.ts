@@ -55,7 +55,6 @@ configureGraphQLGit({
       ]);
       // oldOid is the pushed ref's CURRENT value (zero for a create), not the parent commit.
       const existingTip = ls.refs.find(r => r.name === `refs/heads/${request.branch}`)?.oid;
-      const existingTip = ls.refs.find(r => r.name === `refs/heads/${request.branch}`)?.oid;
       const result = await client.push(request.owner, request.repo, [
         { oldOid: existingTip ?? ZERO_OID, newOid: commitOid, ref: `refs/heads/${request.branch}` },
       ], { pack });

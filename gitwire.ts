@@ -401,12 +401,52 @@ function buildV2FetchResponse(
   repo: Repo,
   request: FetchRequestV2,
 ): FetchResult {
-  const { objects: toSend, tips } = objectsToSend(repo, request.wants, request.haves, request.shallow);
+  const haveClosure = repo.reachable([...request.haves, ...(request.shallow ?? [])]);
+  let sendOids: Set<string>;
+  const shallow: string[] = [];
+  const unshallow: string[] = [];
+  const depth = request.depth ?? 0;
+  if (depth > 0) {
+    // Walk commits generation by generation, cut off at `depth`; the boundary commits are shallow.
+    const included = new Map<string, number>();
+    const queue: Array<{ oid: string; gen: number }> = [];
+    for (const want of request.wants) if (isObjectId(want)) queue.push({ oid: want, gen: 1 });
+    const boundary: string[] = [];
+    while (queue.length) {
+      const { oid, gen } = queue.shift()!;
+      if (included.has(oid) || !isObjectId(oid)) continue;
+      const object = repo.objects.get(oid);
+      if (object === undefined || object.type !== 'commit') continue;
+      included.set(oid, gen);
+      const parents = parseCommit(object.data).parents;
+      if (gen >= depth) {
+        if (parents.length > 0) boundary.push(oid);
+        continue;
+      }
+      for (const parent of parents) if (isObjectId(parent)) queue.push({ oid: parent, gen: gen + 1 });
+    }
+    // Never send anything below the boundary: exclude the boundary parents' closure.
+    const boundaryParents: string[] = [];
+    for (const oid of boundary) {
+      const object = repo.objects.get(oid);
+      if (object !== undefined && object.type === 'commit') boundaryParents.push(...parseCommit(object.data).parents);
+    }
+    const excluded = repo.reachable(boundaryParents);
+    sendOids = new Set([...repo.reachable(included.keys())].filter((oid) => !excluded.has(oid)));
+    for (const oid of boundary) shallow.push(oid);
+    // Commits the client previously treated as shallow that are now interior become unshallow.
+    for (const s of request.shallow ?? []) if (included.has(s) && !boundary.includes(s)) unshallow.push(s);
+  } else {
+    sendOids = new Set([...repo.reachable(request.wants)].filter((oid) => !haveClosure.has(oid)));
+  }
+  const toSend: GitObject[] = [];
+  for (const oid of sendOids) {
+    const object = repo.objects.get(oid);
+    if (object !== undefined) toSend.push(object);
+  }
   const pack = toSend.length > 0 ? writePack(toSend) : Buffer.alloc(0);
   const objects = new Map<string, GitObject>();
   for (const obj of toSend) objects.set(hashObject(obj.type, obj.data), obj);
-  const shallow = request.depth ? computeShallowInfo(repo, request.wants, request.depth) : [];
-  const unshallow = request.shallow?.filter((s) => !shallow.includes(s)) ?? [];
   const acks = request.done ? ['NAK'] : [];
   return {
     protocol: 2,

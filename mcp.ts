@@ -1,28 +1,28 @@
-// Model Context Protocol at /mcp — JSON-RPC 2.0 over Streamable HTTP (revision 2026-07-28).
-// Supports server/discover, initialize, tools/list, tools/call with the 6 required tools.
+// MCP endpoint /mcp: JSON-RPC 2.0 over Streamable HTTP (revision 2026-07-28). Exposes discovery,
+// initialize, tools/list and tools/call for the six required GitHub-shaped tools.
 
 import type { Store, Repo, Issue, Pull } from './store.ts';
 import { isObjectId } from './store.ts';
 
 const MCP_REVISION = '2026-07-28';
 export { MCP_REVISION };
-const LEGACY_REVISIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const OLDER_REVISIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 
-interface JsonRpcRequest {
+interface RpcCall {
   jsonrpc: '2.0';
   id?: string | number | null;
   method: string;
   params?: Record<string, unknown>;
 }
 
-interface JsonRpcResponse {
+interface RpcReply {
   jsonrpc: '2.0';
   id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
 }
 
-interface McpTool {
+interface ToolDefinition {
   name: string;
   title: string;
   description: string;
@@ -33,8 +33,7 @@ interface McpTool {
   };
 }
 
-// The 6 required tools (matching github-mcp-server names)
-const TOOLS: McpTool[] = [
+const TOOL_CATALOG: ToolDefinition[] = [
   {
     name: 'create_repo',
     title: 'Create Repository',
@@ -124,18 +123,18 @@ const TOOLS: McpTool[] = [
   },
 ];
 
-function rpcSuccess(id: string | number | null, result: unknown): JsonRpcResponse {
-  return { jsonrpc: '2.0', id, result };
+function okReply(id: string | number | null, payload: unknown): RpcReply {
+  return { jsonrpc: '2.0', id, result: payload };
 }
 
-function rpcError(id: string | number | null, code: number, message: string, data?: unknown): JsonRpcResponse {
+function failReply(id: string | number | null, code: number, message: string, data?: unknown): RpcReply {
   return { jsonrpc: '2.0', id, error: { code, message, data } };
 }
 
-function discoverResult(): unknown {
+function discoveryPayload(): unknown {
   return {
     resultType: 'DiscoverResult',
-    supportedVersions: [MCP_REVISION, ...LEGACY_REVISIONS],
+    supportedVersions: [MCP_REVISION, ...OLDER_REVISIONS],
     capabilities: { tools: {} },
     serverInfo: { name: 'entry-forge', version: '1.0.0' },
     instructions: 'GitHub-compatible MCP server for github-core-clone-01',
@@ -146,26 +145,25 @@ function discoverResult(): unknown {
   };
 }
 
-function initializeResult(protocolVersion: string): unknown {
+function initializationPayload(version: string): unknown {
   return {
-    protocolVersion,
+    protocolVersion: version,
     capabilities: { tools: {} },
     serverInfo: { name: 'entry-forge', version: '1.0.0' },
   };
 }
 
-function toolsListResult(): unknown {
-  return { tools: TOOLS.map(t => ({ ...t })) };
+function catalogPayload(): unknown {
+  return { tools: TOOL_CATALOG.map(entry => ({ ...entry })) };
 }
 
-// Tool implementations
-async function callCreateRepo(args: Record<string, unknown>, store: Store): Promise<unknown> {
+async function doCreateRepository(args: Record<string, unknown>, store: Store): Promise<unknown> {
   const name = String(args.name);
   const description = String(args.description ?? '');
-  const isPrivate = args.private === true;
-  const result = store.create(name, description, isPrivate);
-  if ('error' in result) throw new Error(result.error);
-  const repo = result.repo;
+  const visibility = args.private === true;
+  const created = store.create(name, description, visibility);
+  if ('error' in created) throw new Error(created.error);
+  const repo: Repo = created.repo;
   return {
     id: `gid://entry-forge/Repository/${repo.id}`,
     databaseId: repo.id,
@@ -183,10 +181,10 @@ async function callCreateRepo(args: Record<string, unknown>, store: Store): Prom
   };
 }
 
-async function callGetRepo(args: Record<string, unknown>, store: Store): Promise<unknown> {
+async function doGetRepository(args: Record<string, unknown>, store: Store): Promise<unknown> {
   const owner = String(args.owner);
-  const repoName = String(args.repo);
-  const repo = store.get(owner, repoName);
+  const name = String(args.repo);
+  const repo = store.get(owner, name);
   if (!repo) throw new Error('Repository not found');
   return {
     id: `gid://entry-forge/Repository/${repo.id}`,
@@ -194,7 +192,7 @@ async function callGetRepo(args: Record<string, unknown>, store: Store): Promise
     name: repo.name,
     nameWithOwner: `${repo.owner}/${repo.name}`,
     owner: { login: repo.owner, id: `gid://entry-forge/User/1001` },
-    url: `http://localhost/${owner}/${repoName}`,
+    url: `http://localhost/${owner}/${name}`,
     isPrivate: repo.isPrivate,
     description: repo.description,
     defaultBranchRef: { name: repo.defaultBranch },
@@ -205,10 +203,10 @@ async function callGetRepo(args: Record<string, unknown>, store: Store): Promise
   };
 }
 
-async function callCreateIssue(args: Record<string, unknown>, store: Store): Promise<unknown> {
+async function doCreateIssue(args: Record<string, unknown>, store: Store): Promise<unknown> {
   const owner = String(args.owner);
-  const repoName = String(args.repo);
-  const repo = store.get(owner, repoName);
+  const name = String(args.repo);
+  const repo = store.get(owner, name);
   if (!repo) throw new Error('Repository not found');
   const title = String(args.title);
   const body = String(args.body ?? '');
@@ -235,7 +233,7 @@ async function callCreateIssue(args: Record<string, unknown>, store: Store): Pro
       title: issue.title,
       body: issue.body,
       state: issue.state,
-      url: `http://localhost/${owner}/${repoName}/issues/${issue.number}`,
+      url: `http://localhost/${owner}/${name}/issues/${issue.number}`,
       createdAt: issue.createdAt,
       updatedAt: issue.updatedAt,
       author: { login: issue.user },
@@ -243,22 +241,22 @@ async function callCreateIssue(args: Record<string, unknown>, store: Store): Pro
   };
 }
 
-async function callListIssues(args: Record<string, unknown>, store: Store): Promise<unknown> {
+async function doListIssues(args: Record<string, unknown>, store: Store): Promise<unknown> {
   const owner = String(args.owner);
-  const repoName = String(args.repo);
-  const repo = store.get(owner, repoName);
+  const name = String(args.repo);
+  const repo = store.get(owner, name);
   if (!repo) throw new Error('Repository not found');
-  const state = (String(args.state ?? 'open')).toLowerCase();
-  let list = [...repo.issues];
-  if (state !== 'all') list = list.filter(i => i.state === state);
+  const wanted = String(args.state ?? 'open').toLowerCase();
+  let matches = [...repo.issues];
+  if (wanted !== 'all') matches = matches.filter(entry => entry.state === wanted);
   return {
-    issues: list.map(issue => ({
+    issues: matches.map(issue => ({
       id: `gid://entry-forge/Issue/${issue.id}`,
       number: issue.number,
       title: issue.title,
       body: issue.body,
       state: issue.state,
-      url: `http://localhost/${owner}/${repoName}/issues/${issue.number}`,
+      url: `http://localhost/${owner}/${name}/issues/${issue.number}`,
       createdAt: issue.createdAt,
       updatedAt: issue.updatedAt,
       author: { login: issue.user },
@@ -266,10 +264,10 @@ async function callListIssues(args: Record<string, unknown>, store: Store): Prom
   };
 }
 
-async function callCreatePullRequest(args: Record<string, unknown>, store: Store): Promise<unknown> {
+async function doCreatePullRequest(args: Record<string, unknown>, store: Store): Promise<unknown> {
   const owner = String(args.owner);
-  const repoName = String(args.repo);
-  const repo = store.get(owner, repoName);
+  const name = String(args.repo);
+  const repo = store.get(owner, name);
   if (!repo) throw new Error('Repository not found');
   const head = String(args.head);
   const base = String(args.base);
@@ -280,7 +278,7 @@ async function callCreatePullRequest(args: Record<string, unknown>, store: Store
   const headSha = repo.refs.get(headRef);
   const baseSha = repo.refs.get(baseRef);
   if (!headSha || !baseSha) throw new Error('Branch not found');
-  const files = repo.diffTree(baseSha, headSha);
+  const changedFiles = repo.diffTree(baseSha, headSha);
   repo.tick();
   const pull: Pull = {
     id: 80_000 + ++repo.pullSeq,
@@ -296,7 +294,7 @@ async function callCreatePullRequest(args: Record<string, unknown>, store: Store
     headSha,
     baseRef: base,
     baseSha,
-    files,
+    files: changedFiles,
     createdAt: repo.iso(),
     user: repo.owner,
   };
@@ -310,7 +308,7 @@ async function callCreatePullRequest(args: Record<string, unknown>, store: Store
       state: 'OPEN',
       headRefName: pull.headRef,
       baseRefName: pull.baseRef,
-      url: `http://localhost/${owner}/${repoName}/pull/${pull.number}`,
+      url: `http://localhost/${owner}/${name}/pull/${pull.number}`,
       mergeable: 'MERGEABLE',
       createdAt: pull.createdAt,
       updatedAt: pull.createdAt,
@@ -319,26 +317,24 @@ async function callCreatePullRequest(args: Record<string, unknown>, store: Store
   };
 }
 
-async function callMergePullRequest(args: Record<string, unknown>, store: Store): Promise<unknown> {
+async function doMergePullRequest(args: Record<string, unknown>, store: Store): Promise<unknown> {
   const owner = String(args.owner);
-  const repoName = String(args.repo);
+  const name = String(args.repo);
   const pullNumber = Number(args.pull_number);
-  const repo = store.get(owner, repoName);
+  const repo = store.get(owner, name);
   if (!repo) throw new Error('Repository not found');
   const pull = repo.pullByNumber(pullNumber);
   if (!pull) throw new Error('Pull request not found');
   if (pull.merged) throw new Error('Already merged');
   const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
   const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
-  if (!baseTip || !headTip || !repo.isAncestor(baseTip, headTip)) {
-    throw new Error('Pull Request is not mergeable');
-  }
-  const mergeCommit = `merge_${pull.id}_${Date.now()}`;
-  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeCommit);
+  if (!baseTip || !headTip || !repo.isAncestor(baseTip, headTip)) throw new Error('Pull Request is not mergeable');
+  const mergeSha = `merge_${pull.id}_${Date.now()}`;
+  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
   pull.merged = true;
   pull.state = 'closed';
   pull.mergedAt = repo.iso();
-  pull.mergeCommitSha = mergeCommit;
+  pull.mergeCommitSha = mergeSha;
   pull.closedAt = pull.mergedAt;
   return {
     pullRequest: {
@@ -352,20 +348,18 @@ async function callMergePullRequest(args: Record<string, unknown>, store: Store)
   };
 }
 
-const TOOL_HANDLERS: Record<string, (args: Record<string, unknown>, store: Store) => Promise<unknown>> = {
-  create_repo: callCreateRepo,
-  get_repo: callGetRepo,
-  create_issue: callCreateIssue,
-  list_issues: callListIssues,
-  create_pull_request: callCreatePullRequest,
-  merge_pull_request: callMergePullRequest,
+const TOOL_IMPLEMENTATIONS: Record<string, (args: Record<string, unknown>, store: Store) => Promise<unknown>> = {
+  create_repo: doCreateRepository,
+  get_repo: doGetRepository,
+  create_issue: doCreateIssue,
+  list_issues: doListIssues,
+  create_pull_request: doCreatePullRequest,
+  merge_pull_request: doMergePullRequest,
 };
 
-function findTool(name: string): McpTool | undefined {
-  return TOOLS.find(t => t.name === name);
+function locateTool(name: string): ToolDefinition | undefined {
+  return TOOL_CATALOG.find(entry => entry.name === name);
 }
-
-// ================================================================ Public handler
 
 export interface McpRequestOptions {
   body: string;
@@ -384,133 +378,116 @@ export interface McpResult {
   isSSE: boolean;
 }
 
-export async function handleMCP(opts: McpRequestOptions): Promise<McpResult> {
-  const { body, headers, method, store, viewer, baseUrl, hasAuth } = opts;
-  const responseHeaders: Record<string, string> = {
+export async function handleMCP(options: McpRequestOptions): Promise<McpResult> {
+  const { body, method, store, hasAuth } = options;
+  const replyHeaders: Record<string, string> = {
     'content-type': 'application/json',
     'mcp-protocol-version': MCP_REVISION,
   };
 
   if (method !== 'POST') {
-    return { status: 405, body: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Method not allowed' } }), headers: responseHeaders, isSSE: false };
-  }
-
-  // Parse JSON-RPC request(s)
-  let requests: JsonRpcRequest[];
-  try {
-    const parsed = JSON.parse(body);
-    if (Array.isArray(parsed)) {
-      requests = parsed as JsonRpcRequest[];
-    } else {
-      requests = [parsed as JsonRpcRequest];
-    }
-  } catch {
     return {
-      status: 400,
-      body: JSON.stringify(rpcError(null, -32700, 'Parse error')),
-      headers: responseHeaders,
+      status: 405,
+      body: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Method not allowed' } }),
+      headers: replyHeaders,
       isSSE: false,
     };
   }
 
-  const responses: JsonRpcResponse[] = [];
+  let incoming: RpcCall[];
+  try {
+    const parsed = JSON.parse(body);
+    incoming = Array.isArray(parsed) ? parsed as RpcCall[] : [parsed as RpcCall];
+  } catch {
+    return { status: 400, body: JSON.stringify(failReply(null, -32700, 'Parse error')), headers: replyHeaders, isSSE: false };
+  }
 
-  for (const req of requests) {
-    const id = req.id ?? null;
-    if (req.jsonrpc !== '2.0') {
-      responses.push(rpcError(id, -32600, 'Invalid Request'));
+  const replies: RpcReply[] = [];
+
+  for (const call of incoming) {
+    const callId = call.id ?? null;
+    if (call.jsonrpc !== '2.0') {
+      replies.push(failReply(callId, -32600, 'Invalid Request'));
       continue;
     }
 
-    // Check auth for methods that require it (all except discover/initialize)
-    const needsAuth = req.method !== 'server/discover' && req.method !== 'initialize';
-    if (needsAuth && !hasAuth) {
-      // Return HTTP 401 for the whole request per spec
+    if (call.method !== 'server/discover' && call.method !== 'initialize' && !hasAuth) {
       return {
         status: 401,
         body: JSON.stringify({ message: 'Unauthorized' }),
-        headers: { ...responseHeaders, 'www-authenticate': 'Bearer' },
+        headers: { ...replyHeaders, 'www-authenticate': 'Bearer' },
         isSSE: false,
       };
     }
 
     try {
-      let result: unknown;
-      switch (req.method) {
+      let payload: unknown;
+      switch (call.method) {
         case 'server/discover': {
-          result = discoverResult();
+          payload = discoveryPayload();
           break;
         }
         case 'initialize': {
-          const params = req.params ?? {};
-          const clientVersion = String(params.protocolVersion ?? '');
-          let negotiated = MCP_REVISION;
-          if (clientVersion && LEGACY_REVISIONS.includes(clientVersion)) negotiated = clientVersion;
-          else if (clientVersion && clientVersion !== MCP_REVISION && !LEGACY_REVISIONS.includes(clientVersion)) {
-            // Unsupported version
-            responses.push(rpcError(id, -32022, 'Unsupported protocol version', { supported: [MCP_REVISION, ...LEGACY_REVISIONS] }));
+          const parameters = call.params ?? {};
+          const requested = String(parameters.protocolVersion ?? '');
+          let agreed = MCP_REVISION;
+          if (requested && OLDER_REVISIONS.includes(requested)) {
+            agreed = requested;
+          } else if (requested && requested !== MCP_REVISION) {
+            replies.push(failReply(callId, -32022, 'Unsupported protocol version', { supported: [MCP_REVISION, ...OLDER_REVISIONS] }));
             continue;
           }
-          result = initializeResult(negotiated);
+          payload = initializationPayload(agreed);
           break;
         }
         case 'notifications/initialized': {
-          // Notification - no response needed
-          responses.push(rpcSuccess(id, {}));
+          replies.push(okReply(callId, {}));
           continue;
         }
         case 'tools/list': {
-          result = toolsListResult();
+          payload = catalogPayload();
           break;
         }
         case 'tools/call': {
-          const params = req.params ?? {};
-          const toolName = String(params.name ?? '');
-          const args = (params.arguments ?? {}) as Record<string, unknown>;
-          const tool = findTool(toolName);
+          const parameters = call.params ?? {};
+          const toolName = String(parameters.name ?? '');
+          const toolArgs = (parameters.arguments ?? {}) as Record<string, unknown>;
+          const tool = locateTool(toolName);
           if (!tool) {
-            responses.push(rpcError(id, -32601, `Method not found: tool '${toolName}' not found`));
+            replies.push(failReply(callId, -32601, `Method not found: tool '${toolName}' not found`));
             continue;
           }
-          // Validate required args
-          const missing = tool.inputSchema.required.filter(r => !(r in args));
+          const missing = tool.inputSchema.required.filter(field => !(field in toolArgs));
           if (missing.length > 0) {
-            responses.push(rpcError(id, -32602, `Invalid params: missing required arguments: ${missing.join(', ')}`));
+            replies.push(failReply(callId, -32602, `Invalid params: missing required arguments: ${missing.join(', ')}`));
             continue;
           }
-          const handler = TOOL_HANDLERS[toolName];
-          if (!handler) {
-            responses.push(rpcError(id, -32601, `Method not found: no handler for '${toolName}'`));
+          const implementation = TOOL_IMPLEMENTATIONS[toolName];
+          if (!implementation) {
+            replies.push(failReply(callId, -32601, `Method not found: no handler for '${toolName}'`));
             continue;
           }
-          const value = await handler(args, store);
-          // MCP tool results carry the payload as a text block plus structured content.
-          result = {
+          const value = await implementation(toolArgs, store);
+          payload = {
             content: [{ type: 'text', text: JSON.stringify(value) }],
             structuredContent: value,
           };
           break;
         }
         default: {
-          responses.push(rpcError(id, -32601, `Method not found: ${req.method}`));
+          replies.push(failReply(callId, -32601, `Method not found: ${call.method}`));
           continue;
         }
       }
-      responses.push(rpcSuccess(id, result));
-    } catch (e) {
-      responses.push(rpcError(id, -32603, (e as Error).message));
+      replies.push(okReply(callId, payload));
+    } catch (problem) {
+      replies.push(failReply(callId, -32603, (problem as Error).message));
     }
   }
 
-  // For notifications (id === null), GitHub returns 202 Accepted
-  const hasNotification = responses.some(r => r.id === null && r.error === undefined);
-  const status = hasNotification && responses.length === 1 ? 202 : 200;
-  const responseBody = responses.length === 1 ? JSON.stringify(responses[0]) : JSON.stringify(responses);
+  const isNotice = replies.some(reply => reply.id === null && reply.error === undefined);
+  const status = isNotice && replies.length === 1 ? 202 : 200;
+  const serialized = replies.length === 1 ? JSON.stringify(replies[0]) : JSON.stringify(replies);
 
-  return {
-    status,
-    body: responseBody,
-    headers: { ...responseHeaders },
-    isSSE: false,
-  };
+  return { status, body: serialized, headers: { ...replyHeaders }, isSSE: false };
 }

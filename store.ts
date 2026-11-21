@@ -1,9 +1,8 @@
-// The forge's in-memory store: repositories, refs, git objects, issues, labels, comments and
-// pulls, plus the commit machinery the REST contents API and the merge path build on.
+// In-memory forge state: repositories, refs, git objects, issues, labels, comments and pulls,
+// with the commit machinery used by the REST contents API and the merge path.
 //
-// Everything lives in memory; a trial runs one fresh process per suite, so nothing persists.
-// All object ids are real git SHA-1 ids computed exactly as git computes them, so objects built
-// over REST read back over smart HTTP and vice versa.
+// A trial is one fresh process, so nothing is persisted. Object ids are genuine git SHA-1 ids:
+// objects written through REST read back over smart HTTP and vice versa.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -22,63 +21,63 @@ export interface TreeEntry {
 }
 
 export const ZERO_OID = '0'.repeat(40);
-const HEX40 = /^[0-9a-f]{40}$/;
+const OID_PATTERN = /^[0-9a-f]{40}$/;
 
 export function isObjectId(value: string): boolean {
-  return HEX40.test(value);
+  return OID_PATTERN.test(value);
 }
 
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
-  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${body.length}\u0000`, 'utf8'));
-  hash.update(body);
-  return hash.digest('hex');
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const digester = createHash('sha1');
+  digester.update(Buffer.from(`${type} ${bytes.length}\u0000`, 'utf8'));
+  digester.update(bytes);
+  return digester.digest('hex');
 }
 
-/** Inflate one zlib stream at `offset`; returns its bytes and the offset just past the stream. */
+/** Inflate the zlib stream at `offset`, returning its bytes and the first byte after the stream. */
 export function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  const inflated = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
+  const stream = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
     buffer: Buffer;
     engine: { bytesWritten: number };
   };
-  return { data: inflated.buffer, next: offset + inflated.engine.bytesWritten };
+  return { data: stream.buffer, next: offset + stream.engine.bytesWritten };
 }
 
 export function parseTree(data: Uint8Array): TreeEntry[] {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const entries: TreeEntry[] = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    const space = buffer.indexOf(0x20, offset);
-    if (space < 0) throw new Error('tree entry has no mode separator');
-    const nul = buffer.indexOf(0x00, space + 1);
-    if (nul < 0 || nul + 21 > buffer.length) throw new Error('tree entry truncated');
-    entries.push({
-      mode: buffer.subarray(offset, space).toString('ascii'),
-      name: buffer.subarray(space + 1, nul).toString('utf8'),
-      oid: buffer.subarray(nul + 1, nul + 21).toString('hex'),
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const parsed: TreeEntry[] = [];
+  let at = 0;
+  while (at < bytes.length) {
+    const spaceAt = bytes.indexOf(0x20, at);
+    if (spaceAt < 0) throw new Error('tree entry has no mode separator');
+    const nulAt = bytes.indexOf(0x00, spaceAt + 1);
+    if (nulAt < 0 || nulAt + 21 > bytes.length) throw new Error('tree entry truncated');
+    parsed.push({
+      mode: bytes.subarray(at, spaceAt).toString('ascii'),
+      name: bytes.subarray(spaceAt + 1, nulAt).toString('utf8'),
+      oid: bytes.subarray(nulAt + 1, nulAt + 21).toString('hex'),
     });
-    offset = nul + 21;
+    at = nulAt + 21;
   }
-  return entries;
+  return parsed;
 }
 
-/** git's tree-entry sort: byte order of the name, a directory compared as if it ended in '/'. */
-function compareTreeNames(a: { name: string; mode: string }, b: { name: string; mode: string }): number {
+// Directories sort as though their names ended with a slash, matching git's tree ordering.
+function treeOrder(a: { name: string; mode: string }, b: { name: string; mode: string }): number {
   const left = Buffer.from(a.mode === '40000' ? `${a.name}/` : a.name, 'utf8');
   const right = Buffer.from(b.mode === '40000' ? `${b.name}/` : b.name, 'utf8');
   return Buffer.compare(left, right);
 }
 
 export function buildTree(entries: ReadonlyArray<TreeEntry>): Buffer {
-  const sorted = [...entries].sort(compareTreeNames);
-  const parts: Buffer[] = [];
-  for (const entry of sorted) {
-    parts.push(Buffer.from(`${entry.mode} ${entry.name}\u0000`, 'utf8'));
-    parts.push(Buffer.from(entry.oid, 'hex'));
+  const ordered = [...entries].sort(treeOrder);
+  const chunks: Buffer[] = [];
+  for (const item of ordered) {
+    chunks.push(Buffer.from(`${item.mode} ${item.name}\u0000`, 'utf8'));
+    chunks.push(Buffer.from(item.oid, 'hex'));
   }
-  return Buffer.concat(parts);
+  return Buffer.concat(chunks);
 }
 
 export interface CommitView {
@@ -90,41 +89,42 @@ export interface CommitView {
 }
 
 export function parseCommit(data: Uint8Array): CommitView {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const blank = buffer.indexOf('\n\n');
-  const headerEnd = blank < 0 ? buffer.length : blank;
-  const message = blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8');
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const breakAt = bytes.indexOf('\n\n');
+  const headerEnd = breakAt < 0 ? bytes.length : breakAt;
+  const message = breakAt < 0 ? '' : bytes.subarray(breakAt + 2).toString('utf8');
   let tree = '';
   const parents: string[] = [];
   let author = '';
   let committer = '';
-  for (const line of buffer.subarray(0, headerEnd).toString('utf8').split('\n')) {
-    if (!line) continue;
-    const space = line.indexOf(' ');
-    const key = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
-    if (key === 'tree') tree = value;
-    else if (key === 'parent') parents.push(value);
-    else if (key === 'author') author = value;
-    else if (key === 'committer') committer = value;
+  for (const row of bytes.subarray(0, headerEnd).toString('utf8').split('\n')) {
+    if (!row) continue;
+    const splitAt = row.indexOf(' ');
+    const field = splitAt < 0 ? row : row.slice(0, splitAt);
+    const value = splitAt < 0 ? '' : row.slice(splitAt + 1);
+    if (field === 'tree') tree = value;
+    else if (field === 'parent') parents.push(value);
+    else if (field === 'author') author = value;
+    else if (field === 'committer') committer = value;
   }
   return { tree, parents, author, committer, message };
 }
 
 export function parseTag(data: Uint8Array): { object: string; type: string; tag: string } {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const blank = buffer.indexOf('\n\n');
-  const headers = new Map<string, string>();
-  for (const line of buffer.subarray(0, blank < 0 ? buffer.length : blank).toString('utf8').split('\n')) {
-    if (!line) continue;
-    const space = line.indexOf(' ');
-    if (space < 0) continue;
-    headers.set(line.slice(0, space), line.slice(space + 1));
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const breakAt = bytes.indexOf('\n\n');
+  const headerLines = bytes.subarray(0, breakAt < 0 ? bytes.length : breakAt).toString('utf8').split('\n');
+  const fields = new Map<string, string>();
+  for (const row of headerLines) {
+    if (!row) continue;
+    const splitAt = row.indexOf(' ');
+    if (splitAt < 0) continue;
+    fields.set(row.slice(0, splitAt), row.slice(splitAt + 1));
   }
   return {
-    object: headers.get('object') ?? '',
-    type: headers.get('type') ?? '',
-    tag: headers.get('tag') ?? '',
+    object: fields.get('object') ?? '',
+    type: fields.get('type') ?? '',
+    tag: fields.get('tag') ?? '',
   };
 }
 
@@ -137,53 +137,53 @@ export function buildCommit(fields: {
   author?: string;
   timestamp?: number;
 }): Buffer {
-  const timestamp = fields.timestamp ?? 1_700_000_000;
-  const who = `${fields.author ?? COMMIT_IDENTITY} ${timestamp} +0000`;
-  const lines = [`tree ${fields.tree}`];
-  for (const parent of fields.parents ?? []) lines.push(`parent ${parent}`);
-  lines.push(`author ${who}`, `committer ${who}`, '');
-  return Buffer.from(`${lines.join('\n')}\n${fields.message}`, 'utf8');
+  const moment = fields.timestamp ?? 1_700_000_000;
+  const signature = `${fields.author ?? COMMIT_IDENTITY} ${moment} +0000`;
+  const rows = [`tree ${fields.tree}`];
+  for (const parent of fields.parents ?? []) rows.push(`parent ${parent}`);
+  rows.push(`author ${signature}`, `committer ${signature}`, '');
+  return Buffer.from(`${rows.join('\n')}\n${fields.message}`, 'utf8');
 }
 
-// ---------------------------------------------------------------- the pack codec
+// ---------------------------------------------------------------- pack codec
 
-const TYPE_CODE: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+const TYPE_TO_CODE: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const CODE_TO_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
-function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
-  const code = TYPE_CODE[type];
+function packHeader(type: GitObjectType, size: number): Buffer {
+  const code = TYPE_TO_CODE[type];
   const bytes: number[] = [];
-  let remaining = size;
-  let first = (code << 4) | (remaining & 0x0f);
-  remaining = Math.floor(remaining / 16);
-  while (remaining > 0) {
-    bytes.push(first | 0x80);
-    first = remaining & 0x7f;
-    remaining = Math.floor(remaining / 128);
+  let rest = size;
+  let current = (code << 4) | (rest & 0x0f);
+  rest = Math.floor(rest / 16);
+  while (rest > 0) {
+    bytes.push(current | 0x80);
+    current = rest & 0x7f;
+    rest = Math.floor(rest / 128);
   }
-  bytes.push(first);
+  bytes.push(current);
   return Buffer.from(bytes);
 }
 
-/** Build a packfile from plain objects (no deltas); trailer is SHA-1 over everything before it. */
+/** Pack plain objects with no deltas; the trailer is SHA-1 of all preceding bytes. */
 export function writePack(objects: Iterable<{ type: GitObjectType; data: Uint8Array }>): Buffer {
-  const parts: Buffer[] = [];
+  const pieces: Buffer[] = [];
   const list = [...objects];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(list.length, 8);
-  parts.push(header);
+  const head = Buffer.allocUnsafe(12);
+  head.write('PACK', 0, 4, 'ascii');
+  head.writeUInt32BE(2, 4);
+  head.writeUInt32BE(list.length, 8);
+  pieces.push(head);
   for (const object of list) {
-    const data = Buffer.isBuffer(object.data) ? object.data : Buffer.from(object.data);
-    parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    const bytes = Buffer.isBuffer(object.data) ? object.data : Buffer.from(object.data);
+    pieces.push(packHeader(object.type, bytes.length));
+    pieces.push(deflateSync(bytes));
   }
-  const body = Buffer.concat(parts);
+  const body = Buffer.concat(pieces);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
-interface RawEntry {
+interface PackedEntry {
   offset: number;
   typeCode: number;
   size: number;
@@ -195,38 +195,38 @@ interface RawEntry {
   oid?: string;
 }
 
-function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
-  let byte = buffer[start]!;
+function decodeSizeHeader(buf: Buffer, start: number): { size: number; next: number; first: number } {
+  let byte = buf[start]!;
   const first = byte;
   let size = byte & 0x0f;
   let shift = 4;
-  let offset = start + 1;
+  let at = start + 1;
   while (byte & 0x80) {
-    byte = buffer[offset++]!;
+    byte = buf[at++]!;
     size += (byte & 0x7f) * 2 ** shift;
     shift += 7;
   }
-  return { size, next: offset, first };
+  return { size, next: at, first };
 }
 
-function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
-  let byte = buffer[start]!;
-  let offset = start + 1;
+function decodeOfsDistance(buf: Buffer, start: number): { baseOffset: number; next: number } {
+  let byte = buf[start]!;
+  let at = start + 1;
   let value = byte & 0x7f;
   while (byte & 0x80) {
-    byte = buffer[offset++]!;
+    byte = buf[at++]!;
     value = (value + 1) * 128 + (byte & 0x7f);
   }
-  return { baseOffset: value, next: offset };
+  return { baseOffset: value, next: at };
 }
 
-function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let offset = 0;
+function patchWithDelta(base: Buffer, delta: Buffer): Buffer {
+  let at = 0;
   const readSize = (): number => {
     let value = 0;
     let shift = 0;
     for (;;) {
-      const byte = delta[offset++]!;
+      const byte = delta[at++]!;
       value += (byte & 0x7f) * 2 ** shift;
       shift += 7;
       if (!(byte & 0x80)) break;
@@ -236,37 +236,37 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   const sourceSize = readSize();
   const targetSize = readSize();
   if (sourceSize !== base.length) throw new Error('delta base size mismatch');
-  const out = Buffer.allocUnsafe(targetSize);
+  const output = Buffer.allocUnsafe(targetSize);
   let written = 0;
-  while (offset < delta.length) {
-    const op = delta[offset++]!;
-    if (op & 0x80) {
-      let copyOffset = 0;
-      let copySize = 0;
+  while (at < delta.length) {
+    const opcode = delta[at++]!;
+    if (opcode & 0x80) {
+      let copyFrom = 0;
+      let copyLength = 0;
       let shift = 0;
       for (let bit = 0; bit < 4; bit += 1) {
-        if (op & (1 << bit)) copyOffset += delta[offset++]! * 2 ** shift;
+        if (opcode & (1 << bit)) copyFrom += delta[at++]! * 2 ** shift;
         shift += 8;
       }
       shift = 0;
       for (let bit = 4; bit < 7; bit += 1) {
-        if (op & (1 << bit)) copySize += delta[offset++]! * 2 ** shift;
+        if (opcode & (1 << bit)) copyLength += delta[at++]! * 2 ** shift;
         shift += 8;
       }
-      if (copySize === 0) copySize = 0x10000;
-      base.copy(out, written, copyOffset, copyOffset + copySize);
-      written += copySize;
-    } else if (op !== 0) {
-      const literal = op & 0x7f;
-      delta.copy(out, written, offset, offset + literal);
-      offset += literal;
-      written += literal;
+      if (copyLength === 0) copyLength = 0x10000;
+      base.copy(output, written, copyFrom, copyFrom + copyLength);
+      written += copyLength;
+    } else if (opcode !== 0) {
+      const literalLength = opcode & 0x7f;
+      delta.copy(output, written, at, at + literalLength);
+      at += literalLength;
+      written += literalLength;
     } else {
       throw new Error('delta opcode 0 is invalid');
     }
   }
   if (written !== targetSize) throw new Error('delta produced the wrong size');
-  return out;
+  return output;
 }
 
 export interface PackReadResult {
@@ -274,89 +274,89 @@ export interface PackReadResult {
   count: number;
 }
 
-/** Read a packfile (v2) and resolve every object, including OFS_DELTA and REF_DELTA. */
+/** Read a v2/v3 pack, resolving OFS_DELTA and REF_DELTA entries via `resolveBase` when needed. */
 export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): PackReadResult {
   if (pack.length < 32 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-  const declaredCount = pack.readUInt32BE(8);
-  const trailerStart = pack.length - 20;
-  const trailer = pack.subarray(trailerStart).toString('hex');
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
-  if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+  const declared = pack.readUInt32BE(8);
+  const endOfEntries = pack.length - 20;
+  const trailer = pack.subarray(endOfEntries).toString('hex');
+  const calculated = createHash('sha1').update(pack.subarray(0, endOfEntries)).digest('hex');
+  if (trailer !== calculated) throw new Error('pack trailer checksum mismatch');
 
-  const raw: RawEntry[] = [];
-  const byOffset = new Map<number, RawEntry>();
-  let offset = 12;
-  for (let index = 0; index < declaredCount; index += 1) {
-    const entryOffset = offset;
-    const header = readVarintSize(pack, offset);
-    offset = header.next;
-    const typeCode = (header.first >> 4) & 0x07;
-    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
-    if (typeCode === 6) {
-      const base = readOfsDeltaBase(pack, offset);
-      offset = base.next;
-      entry.baseOffset = entryOffset - base.baseOffset;
-      if (entry.baseOffset < 0) throw new Error('ofs-delta names an invalid base');
-    } else if (typeCode === 7) {
-      entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
-    } else if (!CODE_TYPE[typeCode]) {
-      throw new Error(`unknown pack type code ${typeCode}`);
+  const entries: PackedEntry[] = [];
+  const byOffset = new Map<number, PackedEntry>();
+  let at = 12;
+  for (let index = 0; index < declared; index += 1) {
+    const entryStart = at;
+    const header = decodeSizeHeader(pack, at);
+    at = header.next;
+    const code = (header.first >> 4) & 0x07;
+    const item: PackedEntry = { offset: entryStart, typeCode: code, size: header.size, data: Buffer.alloc(0) };
+    if (code === 6) {
+      const base = decodeOfsDistance(pack, at);
+      at = base.next;
+      item.baseOffset = entryStart - base.baseOffset;
+      if (item.baseOffset < 0) throw new Error('ofs-delta names an invalid base');
+    } else if (code === 7) {
+      item.baseOid = pack.subarray(at, at + 20).toString('hex');
+      at += 20;
+    } else if (!CODE_TO_TYPE[code]) {
+      throw new Error(`unknown pack type code ${code}`);
     }
-    const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(pack.subarray(0, endOfEntries), at);
     if (inflated.data.length !== header.size) throw new Error('pack entry size mismatch');
-    entry.data = inflated.data;
-    offset = inflated.next;
-    raw.push(entry);
-    byOffset.set(entryOffset, entry);
+    item.data = inflated.data;
+    at = inflated.next;
+    entries.push(item);
+    byOffset.set(entryStart, item);
   }
-  if (offset !== trailerStart) throw new Error('pack has stray bytes before its trailer');
+  if (at !== endOfEntries) throw new Error('pack has stray bytes before its trailer');
 
-  const objects = new Map<string, GitObject>();
-  const resolvedByOid = new Map<string, RawEntry>();
-  const resolve = (entry: RawEntry): { type: GitObjectType; data: Buffer } => {
-    if (entry.resolved && entry.resolvedType && entry.oid) return { type: entry.resolvedType, data: entry.resolved };
-    let type: GitObjectType;
-    let data: Buffer;
-    if (entry.typeCode === 6) {
-      const baseEntry = byOffset.get(entry.baseOffset!);
-      if (!baseEntry) throw new Error('ofs-delta base is not in the pack');
-      const base = resolve(baseEntry);
-      type = base.type;
-      data = applyDelta(base.data, entry.data);
-    } else if (entry.typeCode === 7) {
-      const wanted = entry.baseOid!;
-      const baseEntry = resolvedByOid.get(wanted);
-      if (baseEntry) {
-        const base = resolve(baseEntry);
-        type = base.type;
-        data = applyDelta(base.data, entry.data);
+  const resolvedObjects = new Map<string, GitObject>();
+  const resolvedEntries = new Map<string, PackedEntry>();
+  const materialize = (item: PackedEntry): { type: GitObjectType; data: Buffer } => {
+    if (item.resolved && item.resolvedType && item.oid) return { type: item.resolvedType, data: item.resolved };
+    let kind: GitObjectType;
+    let content: Buffer;
+    if (item.typeCode === 6) {
+      const parent = byOffset.get(item.baseOffset!);
+      if (!parent) throw new Error('ofs-delta base is not in the pack');
+      const base = materialize(parent);
+      kind = base.type;
+      content = patchWithDelta(base.data, item.data);
+    } else if (item.typeCode === 7) {
+      const wanted = item.baseOid!;
+      const inPack = resolvedEntries.get(wanted);
+      if (inPack) {
+        const base = materialize(inPack);
+        kind = base.type;
+        content = patchWithDelta(base.data, item.data);
       } else {
-        const external = resolveBase?.(wanted);
-        if (!external) throw new Error(`ref-delta base ${wanted} is unavailable`);
-        type = external.type;
-        data = applyDelta(external.data, entry.data);
+        const outside = resolveBase?.(wanted);
+        if (!outside) throw new Error(`ref-delta base ${wanted} is unavailable`);
+        kind = outside.type;
+        content = patchWithDelta(outside.data, item.data);
       }
     } else {
-      type = CODE_TYPE[entry.typeCode]!;
-      data = entry.data;
+      kind = CODE_TO_TYPE[item.typeCode]!;
+      content = item.data;
     }
-    const oid = hashObject(type, data);
-    entry.resolved = data;
-    entry.resolvedType = type;
-    entry.oid = oid;
-    resolvedByOid.set(oid, entry);
-    return { type, data };
+    const oid = hashObject(kind, content);
+    item.resolved = content;
+    item.resolvedType = kind;
+    item.oid = oid;
+    resolvedEntries.set(oid, item);
+    return { type: kind, data: content };
   };
 
-  for (const entry of raw) {
-    const resolved = resolve(entry);
-    const oid = entry.oid ?? hashObject(entry.resolvedType!, entry.resolved!);
-    if (!objects.has(oid)) objects.set(oid, { type: entry.resolvedType!, data: entry.resolved! });
+  for (const item of entries) {
+    materialize(item);
+    const oid = item.oid ?? hashObject(item.resolvedType!, item.resolved!);
+    if (!resolvedObjects.has(oid)) resolvedObjects.set(oid, { type: item.resolvedType!, data: item.resolved! });
   }
-  return { objects, count: declaredCount };
+  return { objects: resolvedObjects, count: declared };
 }
 
 // ---------------------------------------------------------------- entities
@@ -429,7 +429,7 @@ export class Repo {
   commentSeq = 0;
   readonly pulls: Pull[] = [];
   pullSeq = 0;
-  /** A monotonic clock so created/updated timestamps order without reading the wall clock. */
+  /** Monotonic clock keeps created/updated timestamps ordered without reading wall time. */
   clock = 0;
 
   constructor(id: number, owner: string, name: string, description: string, isPrivate: boolean) {
@@ -468,129 +468,111 @@ export class Repo {
     return `refs/heads/${this.defaultBranch}`;
   }
 
-  /** Every ref sorted HEAD-first then by name, for advertisements and listings. */
+  /** HEAD first, then all refs by name: the order used by advertisements and listings. */
   sortedRefs(): Array<{ name: string; oid: string }> {
-    const out: Array<{ name: string; oid: string }> = [];
-    const head = this.refs.get(this.headRefName());
-    if (head !== undefined) out.push({ name: 'HEAD', oid: head });
-    const names = [...this.refs.keys()].sort();
-    for (const name of names) out.push({ name, oid: this.refs.get(name)! });
-    return out;
+    const listed: Array<{ name: string; oid: string }> = [];
+    const tip = this.refs.get(this.headRefName());
+    if (tip !== undefined) listed.push({ name: 'HEAD', oid: tip });
+    for (const name of [...this.refs.keys()].sort()) listed.push({ name, oid: this.refs.get(name)! });
+    return listed;
   }
 
-  /** Peel an object through tag objects down to a non-tag; null when the oid is unknown. */
+  /** Follow tag objects until a non-tag object is reached; null for unknown ids. */
   peel(oid: string): string | null {
     let current = oid;
     for (let depth = 0; depth < 16; depth += 1) {
-      const object = this.objects.get(current);
-      if (object === undefined) return null;
-      if (object.type !== 'tag') return current;
-      current = parseTag(object.data).object;
+      const item = this.objects.get(current);
+      if (item === undefined) return null;
+      if (item.type !== 'tag') return current;
+      current = parseTag(item.data).object;
       if (!isObjectId(current)) return null;
     }
     return null;
   }
 
-  /** Every object reachable from `roots`: commit -> tree+parents, tag -> target, tree -> entries. */
+  /** Object ids reachable from `roots`: commits contribute tree and parents, trees their entries. */
   reachable(roots: Iterable<string>): Set<string> {
-    const seen = new Set<string>();
-    const queue: string[] = [];
-    for (const root of roots) if (isObjectId(root)) queue.push(root);
-    while (queue.length) {
-      const oid = queue.pop()!;
-      if (seen.has(oid)) continue;
-      const object = this.objects.get(oid);
-      if (object === undefined) continue;
-      seen.add(oid);
-      if (object.type === 'commit') {
-        const commit = parseCommit(object.data);
-        queue.push(commit.tree);
-        for (const parent of commit.parents) queue.push(parent);
-      } else if (object.type === 'tag') {
-        const target = parseTag(object.data).object;
-        if (isObjectId(target)) queue.push(target);
-      } else if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) {
+    const visited = new Set<string>();
+    const pending: string[] = [];
+    for (const root of roots) if (isObjectId(root)) pending.push(root);
+    while (pending.length) {
+      const oid = pending.pop()!;
+      if (visited.has(oid)) continue;
+      const item = this.objects.get(oid);
+      if (item === undefined) continue;
+      visited.add(oid);
+      if (item.type === 'commit') {
+        const commit = parseCommit(item.data);
+        pending.push(commit.tree);
+        for (const parent of commit.parents) pending.push(parent);
+      } else if (item.type === 'tag') {
+        const target = parseTag(item.data).object;
+        if (isObjectId(target)) pending.push(target);
+      } else if (item.type === 'tree') {
+        for (const entry of parseTree(item.data)) {
           if (entry.mode === '160000') continue;
-          queue.push(entry.oid);
+          pending.push(entry.oid);
         }
       }
     }
-    return seen;
+    return visited;
   }
 
-  /** Whether `descendant` has `ancestor` in its commit ancestry (equal counts as true). */
+  /** True when `descendant` has `ancestor` in its commit history (equality counts). */
   isAncestor(ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
-    const seen = new Set<string>();
-    const queue = [descendant];
-    while (queue.length) {
-      const oid = queue.pop()!;
-      if (seen.has(oid) || !isObjectId(oid)) continue;
-      seen.add(oid);
-      const object = this.objects.get(oid);
-      if (object === undefined || object.type !== 'commit') continue;
-      const commit = parseCommit(object.data);
+    const visited = new Set<string>();
+    const pending = [descendant];
+    while (pending.length) {
+      const oid = pending.pop()!;
+      if (visited.has(oid) || !isObjectId(oid)) continue;
+      visited.add(oid);
+      const item = this.objects.get(oid);
+      if (item === undefined || item.type !== 'commit') continue;
+      const commit = parseCommit(item.data);
       for (const parent of commit.parents) {
         if (parent === ancestor) return true;
-        queue.push(parent);
+        pending.push(parent);
       }
     }
     return false;
   }
 
-  /**
-   * Commit a path change onto `refName`: build the new tree with `data` at `path`
-   * (data === null removes it), then a commit on top of the ref's current tip, then move the ref.
-   */
+  // Put `data` at `path` on `refName` (null deletes it) and advance the ref with a new commit.
   commitTreeChange(refName: string, path: string, data: Buffer | null, message: string): { commitSha: string; blobSha: string | null } {
     let tip = this.refs.get(refName) ?? null;
     if (tip !== null && this.objects.get(tip) === undefined) tip = null;
     let rootTree = '';
     if (tip !== null) rootTree = parseCommit(this.objects.get(tip)!.data).tree;
 
-    const setEntry = (treeOid: string, segments: readonly string[], index: number): string => {
-      const entries: TreeEntry[] = treeOid === '' ? [] : parseTree(this.objects.get(treeOid)!.data);
+    const placeAt = (treeOid: string, segments: readonly string[], index: number): string => {
+      const here: TreeEntry[] = treeOid === '' ? [] : parseTree(this.objects.get(treeOid)!.data);
       const name = segments[index]!;
-      const remaining = index + 1;
-      const existing = entries.find((entry) => entry.name === name);
-      let entryOid: string;
-      if (remaining === segments.length) {
-        if (data === null) {
-          entryOid = '';
-        } else {
-          entryOid = this.put('blob', data);
-        }
+      const nextIndex = index + 1;
+      const existing = here.find((entry) => entry.name === name);
+      let childOid: string;
+      if (nextIndex === segments.length) {
+        childOid = data === null ? '' : this.put('blob', data);
       } else {
-        const childOid = existing !== undefined && existing.mode === '40000' ? existing.oid : '';
-        entryOid = setEntry(childOid, segments, remaining);
-        if (entryOid === '') {
-          entryOid = '';
-        }
+        const nested = existing !== undefined && existing.mode === '40000' ? existing.oid : '';
+        childOid = placeAt(nested, segments, nextIndex);
       }
-      const without = entries.filter((entry) => entry.name !== name);
-      if (entryOid === '') {
-        const rebuilt = this.put('tree', buildTree(without));
-        return rebuilt;
-      }
-      const mode = remaining === segments.length ? '100644' : '40000';
-      const merged = [...without, { mode, name, oid: entryOid }];
-      return this.put('tree', buildTree(merged));
+      const rest = here.filter((entry) => entry.name !== name);
+      if (childOid === '') return this.put('tree', buildTree(rest));
+      const mode = nextIndex === segments.length ? '100644' : '40000';
+      return this.put('tree', buildTree([...rest, { mode, name, oid: childOid }]));
     };
 
     const segments = path.split('/').filter((segment) => segment !== '');
-    const newRoot = setEntry(rootTree, segments, 0);
-    let blobSha: string | null = null;
-    if (data !== null) {
-      blobSha = hashObject('blob', data);
-    }
-    const commitData = buildCommit({
+    const newRoot = placeAt(rootTree, segments, 0);
+    const blobSha = data === null ? null : hashObject('blob', data);
+    const commitBytes = buildCommit({
       tree: newRoot,
       parents: tip === null ? [] : [tip],
       message: message.endsWith('\n') ? message : `${message}\n`,
       timestamp: this.tick(),
     });
-    const commitSha = this.put('commit', commitData);
+    const commitSha = this.put('commit', commitBytes);
     this.refs.set(refName, commitSha);
     return { commitSha, blobSha };
   }
@@ -620,7 +602,7 @@ export class Repo {
     return null;
   }
 
-  /** The entries directly under `dirPath` (or the root when dirPath is empty) on `refName`. */
+  /** Direct children of `dirPath` (or the root when empty) on `refName`. */
   listDir(refName: string, dirPath: string): Array<{ type: 'file' | 'dir'; name: string; path: string; oid: string }> {
     const tip = this.refs.get(refName);
     if (tip === undefined) return [];
@@ -644,53 +626,51 @@ export class Repo {
     }));
   }
 
-  /** All commits reachable from a ref tip, newest first (first-parent-ish walk). */
+  /** Reachable commits from a ref tip, newest first (breadth-leaning walk). */
   commitLog(refName: string): Array<{ sha: string; commit: CommitView }> {
     const tip = this.refs.get(refName);
     if (tip === undefined) return [];
-    const out: Array<{ sha: string; commit: CommitView }> = [];
-    const seen = new Set<string>();
-    const queue = [tip];
-    while (queue.length) {
-      const oid = queue.shift()!;
-      if (seen.has(oid) || !isObjectId(oid)) continue;
-      seen.add(oid);
-      const object = this.objects.get(oid);
-      if (object === undefined || object.type !== 'commit') continue;
-      const commit = parseCommit(object.data);
-      out.push({ sha: oid, commit });
-      for (const parent of commit.parents) queue.push(parent);
+    const log: Array<{ sha: string; commit: CommitView }> = [];
+    const visited = new Set<string>();
+    const pending = [tip];
+    while (pending.length) {
+      const oid = pending.shift()!;
+      if (visited.has(oid) || !isObjectId(oid)) continue;
+      visited.add(oid);
+      const item = this.objects.get(oid);
+      if (item === undefined || item.type !== 'commit') continue;
+      const commit = parseCommit(item.data);
+      log.push({ sha: oid, commit });
+      for (const parent of commit.parents) pending.push(parent);
     }
-    return out;
+    return log;
   }
 
-  /** One file's line-count diff between two tree paths, as pull-request file stats. */
+  /** Line-count file stats for one diff between two tree-ish tips. */
   diffTree(baseTip: string | null, headTip: string): PullFile[] {
     const flatten = (tip: string | null): Map<string, string> => {
       const files = new Map<string, string>();
       if (tip === null) return files;
-      const object = this.objects.get(tip);
-      if (object === undefined) return files;
+      const item = this.objects.get(tip);
+      if (item === undefined) return files;
       const walk = (treeOid: string, prefix: string): void => {
         const tree = this.objects.get(treeOid);
         if (tree === undefined || tree.type !== 'tree') return;
         for (const entry of parseTree(tree.data)) {
-          if (entry.mode === '40000') {
-            walk(entry.oid, prefix === '' ? entry.name : `${prefix}/${entry.name}`);
-          } else if (entry.mode !== '160000') {
-            files.set(prefix === '' ? entry.name : `${prefix}/${entry.name}`, entry.oid);
-          }
+          const fullPath = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+          if (entry.mode === '40000') walk(entry.oid, fullPath);
+          else if (entry.mode !== '160000') files.set(fullPath, entry.oid);
         }
       };
-      if (object.type === 'commit') walk(parseCommit(object.data).tree, '');
-      else if (object.type === 'tree') walk(object === this.objects.get(tip) ? tip : tip, '');
+      if (item.type === 'commit') walk(parseCommit(item.data).tree, '');
+      else if (item.type === 'tree') walk(item === this.objects.get(tip) ? tip : tip, '');
       return files;
     };
     const before = flatten(baseTip);
     const after = flatten(headTip);
-    const paths = new Set([...before.keys(), ...after.keys()]);
-    const files: PullFile[] = [];
-    for (const path of [...paths].sort()) {
+    const allPaths = new Set([...before.keys(), ...after.keys()]);
+    const changes: PullFile[] = [];
+    for (const path of [...allPaths].sort()) {
       const oldOid = before.get(path);
       const newOid = after.get(path);
       if (oldOid === newOid) continue;
@@ -698,21 +678,19 @@ export class Repo {
       const newBlob = newOid === undefined ? null : this.objects.get(newOid);
       const oldLines = oldBlob === null || oldBlob === undefined ? [] : oldBlob.data.toString('utf8').split('\n');
       const newLines = newBlob === null || newBlob === undefined ? [] : newBlob.data.toString('utf8').split('\n');
-      const oldSet = new Map<string, number>();
-      for (const line of oldLines) oldSet.set(line, (oldSet.get(line) ?? 0) + 1);
-      const newSet = new Map<string, number>();
-      for (const line of newLines) newSet.set(line, (newSet.get(line) ?? 0) + 1);
-      let additions = 0;
+      const oldCount = new Map<string, number>();
+      for (const line of oldLines) oldCount.set(line, (oldCount.get(line) ?? 0) + 1);
+      const newCount = new Map<string, number>();
+      for (const line of newLines) newCount.set(line, (newCount.get(line) ?? 0) + 1);
+      let insertions = 0;
       let deletions = 0;
-      for (const [line, count] of newSet) additions += Math.max(0, count - (oldSet.get(line) ?? 0));
-      for (const [line, count] of oldSet) deletions += Math.max(0, count - (newSet.get(line) ?? 0));
+      for (const [line, count] of newCount) insertions += Math.max(0, count - (oldCount.get(line) ?? 0));
+      for (const [line, count] of oldCount) deletions += Math.max(0, count - (newCount.get(line) ?? 0));
       const status: PullFile['status'] = oldBlob === null || oldBlob === undefined ? 'added' : newBlob === null || newBlob === undefined ? 'removed' : 'modified';
-      if (status === 'removed') {
-        additions = 0;
-      }
-      files.push({ filename: path, status, additions, deletions, changes: additions + deletions });
+      if (status === 'removed') insertions = 0;
+      changes.push({ filename: path, status, additions: insertions, deletions, changes: insertions + deletions });
     }
-    return files;
+    return changes;
   }
 
   issueByNumber(number: number): Issue | undefined {
@@ -756,7 +734,7 @@ export class Store {
     return this.repos.delete(this.key(owner, name));
   }
 
-  /** The viewer's repos in creation order. */
+  /** The viewer's repositories in creation order. */
   viewerRepos(): Repo[] {
     return [...this.repos.values()].filter((repo) => repo.owner.toLowerCase() === this.viewer.toLowerCase());
   }

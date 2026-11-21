@@ -1,112 +1,109 @@
-// Runs the kit's REAL conformance suite against the local forge.
+// Run the kit's real conformance suite against the local forge.
 // Usage: node --experimental-strip-types run-kit-suite.ts [group...]
 
-const KIT = '/Users/devin/makefun/kit-ghclone/github-core-clone-01-kit/program/env/src';
-const BASE = process.env.FORGE_URL ?? 'http://localhost:41234';
-const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? 'test-token';
+const kitSource = '/Users/devin/makefun/kit-ghclone/github-core-clone-01-kit/program/env/src';
+const forgeOrigin = process.env.FORGE_URL ?? 'http://localhost:41234';
+const bearerToken = process.env.MAKEFUN_SHOP_TOKEN ?? 'test-token';
 
-const { buildScenario } = await import(`${KIT}/wire.ts`);
-const { restChecks, restProtocolChecks } = await import(`${KIT}/checks-rest.ts`);
-const { GRAPHQL_CHECKS, configureGraphQLGit } = await import(`${KIT}/checks-graphql.ts`);
-const { MCP_CHECKS } = await import(`${KIT}/checks-mcp.ts`);
-const { GIT_CHECKS } = await import(`${KIT}/checks-git.ts`);
-const { GitClient } = await import(`${KIT}/git-client.ts`);
+const { buildScenario } = await import(`${kitSource}/wire.ts`);
+const { restChecks, restProtocolChecks } = await import(`${kitSource}/checks-rest.ts`);
+const { GRAPHQL_CHECKS, configureGraphQLGit } = await import(`${kitSource}/checks-graphql.ts`);
+const { MCP_CHECKS } = await import(`${kitSource}/checks-mcp.ts`);
+const { GIT_CHECKS } = await import(`${kitSource}/checks-git.ts`);
+const { GitClient } = await import(`${kitSource}/git-client.ts`);
 
-const scenario = buildScenario();
-const groups = process.argv.slice(2);
+const builtScenario = buildScenario();
+const selectedGroups = process.argv.slice(2);
 
-const suites: Array<{ name: string; specs: ReturnType<typeof restChecks> }> = [];
-if (groups.length === 0 || groups.includes('repos')) suites.push({ name: 'repos+issues+pulls', specs: restChecks() });
-if (groups.length === 0 || groups.includes('protocol')) suites.push({ name: 'protocol', specs: restProtocolChecks() });
-if (groups.length === 0 || groups.includes('graphql')) suites.push({ name: 'graphql', specs: GRAPHQL_CHECKS as any });
-if (groups.length === 0 || groups.includes('mcp')) suites.push({ name: 'mcp', specs: MCP_CHECKS as any });
-if (groups.length === 0 || groups.includes('git')) suites.push({ name: 'git', specs: GIT_CHECKS as any });
+const allSuites: Array<{ name: string; specs: ReturnType<typeof restChecks> }> = [];
+if (selectedGroups.length === 0 || selectedGroups.includes('repos')) allSuites.push({ name: 'repos+issues+pulls', specs: restChecks() });
+if (selectedGroups.length === 0 || selectedGroups.includes('protocol')) allSuites.push({ name: 'protocol', specs: restProtocolChecks() });
+if (selectedGroups.length === 0 || selectedGroups.includes('graphql')) allSuites.push({ name: 'graphql', specs: GRAPHQL_CHECKS as any });
+if (selectedGroups.length === 0 || selectedGroups.includes('mcp')) allSuites.push({ name: 'mcp', specs: MCP_CHECKS as any });
+if (selectedGroups.length === 0 || selectedGroups.includes('git')) allSuites.push({ name: 'git', specs: GIT_CHECKS as any });
 
-// Install the git adapter the GraphQL PR checks need (uses the kit's own GitClient).
+// GraphQL PR checks need a branch push; supply one that builds the objects with the kit's helpers.
 configureGraphQLGit({
-  async pushBranch(request) {
-    const client = new GitClient({ baseUrl: BASE, token: TOKEN });
+  async pushBranch(req) {
+    const transport = new GitClient({ baseUrl: forgeOrigin, token: bearerToken });
     try {
-      // Find the base commit: clone nothing; look at the repo's refs via ls-refs after ensuring base exists.
-      const ls = await client.lsRefs(request.owner, request.repo, {});
-      const baseRef = ls.refs.find(r => r.name === `refs/heads/${request.from ?? 'main'}`);
-      const baseTip = baseRef?.oid;
-      // Build objects client-side: tree with one file, commit on top of baseTip.
-      const { buildTree, buildCommit, hashObject, ZERO_OID } = await import(`${KIT}/git-client.ts`);
-      const blob = Buffer.from(request.content, 'utf8');
-      const blobOid = hashObject('blob', blob);
-      const tree = buildTree([{ mode: '100644', name: request.path, oid: blobOid }]);
-      const treeOid = hashObject('tree', tree);
-      // For a commit with a parent, include the parent tree too? No: our tree replaces the whole root.
-      // The forge accepts a tree that only holds the pushed file (it diffs per path).
-      const commit = buildCommit({
-        tree: treeOid,
-        parents: baseTip && baseTip !== ZERO_OID ? [baseTip] : [],
-        message: request.message.endsWith('\n') ? request.message : `${request.message}\n`,
+      const listing = await transport.lsRefs(req.owner, req.repo, {});
+      const baseRef = listing.refs.find(r => r.name === `refs/heads/${req.from ?? 'main'}`);
+      const parent = baseRef?.oid;
+      const { buildTree, buildCommit, hashObject, ZERO_OID } = await import(`${kitSource}/git-client.ts`);
+      const fileBytes = Buffer.from(req.content, 'utf8');
+      const blobId = hashObject('blob', fileBytes);
+      const treeBytes = buildTree([{ mode: '100644', name: req.path, oid: blobId }]);
+      const treeId = hashObject('tree', treeBytes);
+      // The root tree contains just the pushed file; the forge diffs per path.
+      const commitBytes = buildCommit({
+        tree: treeId,
+        parents: parent && parent !== ZERO_OID ? [parent] : [],
+        message: req.message.endsWith('\n') ? req.message : `${req.message}\n`,
         author: 'entry-forge <forge@entry.invalid>',
         timestamp: 1735689600,
       });
-      const commitOid = hashObject('commit', commit);
-      const { writePack } = await import(`${KIT}/git-client.ts`);
-      const pack = writePack([
-        { type: 'blob', data: blob },
-        { type: 'tree', data: tree },
-        { type: 'commit', data: commit },
+      const commitId = hashObject('commit', commitBytes);
+      const { writePack } = await import(`${kitSource}/git-client.ts`);
+      const packed = writePack([
+        { type: 'blob', data: fileBytes },
+        { type: 'tree', data: treeBytes },
+        { type: 'commit', data: commitBytes },
       ]);
-      // oldOid is the pushed ref's CURRENT value (zero for a create), not the parent commit.
-      const existingTip = ls.refs.find(r => r.name === `refs/heads/${request.branch}`)?.oid;
-      const result = await client.push(request.owner, request.repo, [
-        { oldOid: existingTip ?? ZERO_OID, newOid: commitOid, ref: `refs/heads/${request.branch}` },
-      ], { pack });
-      if (!result.report) return 'no report-status';
-      if (!result.report.unpackOk) return `unpack failed: ${result.report.unpackDetail}`;
-      const ref = result.report.refs.find(r => r.ref === `refs/heads/${request.branch}`);
-      if (!ref?.ok) return `${ref?.reason ?? 'refused'}`;
+      // The ref's old value is its current tip (zero when creating), not the commit's parent.
+      const oldTip = listing.refs.find(r => r.name === `refs/heads/${req.branch}`)?.oid;
+      const pushed = await transport.push(req.owner, req.repo, [
+        { oldOid: oldTip ?? ZERO_OID, newOid: commitId, ref: `refs/heads/${req.branch}` },
+      ], { pack: packed });
+      if (!pushed.report) return 'no report-status';
+      if (!pushed.report.unpackOk) return `unpack failed: ${pushed.report.unpackDetail}`;
+      const pushedRef = pushed.report.refs.find(r => r.ref === `refs/heads/${req.branch}`);
+      if (!pushedRef?.ok) return `${pushedRef?.reason ?? 'refused'}`;
       return null;
-    } catch (e) {
-      return (e as Error).message;
+    } catch (error) {
+      return (error as Error).message;
     }
   },
 });
 
-let passed = 0, failed = 0;
-const failures: string[] = [];
+let successes = 0, failures = 0;
+const failureLog: string[] = [];
 
-for (const suite of suites) {
+for (const suite of allSuites) {
   console.log(`\n=== ${suite.name} (${suite.specs.length} checks) ===`);
   for (const spec of suite.specs) {
-    const context = {
-      baseUrl: BASE,
-      token: TOKEN,
-      scenario,
+    const checkContext = {
+      baseUrl: forgeOrigin,
+      token: bearerToken,
+      scenario: builtScenario,
       signal: new AbortController().signal,
       deadlineMs: performance.now() + 60_000,
       timeoutMs: spec.timeoutMs ?? 15_000,
-      log: (_m: string) => {},
+      log: (_message: string) => {},
     };
-    const started = performance.now();
-    let result: { ok: boolean; detail?: string };
+    const began = performance.now();
+    let verdict: { ok: boolean; detail?: string };
     try {
-      result = await spec.fn(context as any);
-    } catch (e) {
-      result = { ok: false, detail: (e as Error).message };
+      verdict = await spec.fn(checkContext as any);
+    } catch (error) {
+      verdict = { ok: false, detail: (error as Error).message };
     }
-    const ms = Math.round(performance.now() - started);
-    if (result.ok) {
-      passed += 1;
-      console.log(`  PASS ${spec.id} (${ms}ms)`);
+    const elapsed = Math.round(performance.now() - began);
+    if (verdict.ok) {
+      successes += 1;
+      console.log(`  PASS ${spec.id} (${elapsed}ms)`);
     } else {
-      failed += 1;
-      const detail = (result.detail ?? '').slice(0, 300);
-      failures.push(`${spec.id}: ${detail}`);
-      console.log(`  FAIL ${spec.id} (${ms}ms): ${detail}`);
+      failures += 1;
+      const detail = (verdict.detail ?? '').slice(0, 300);
+      failureLog.push(`${spec.id}: ${detail}`);
+      console.log(`  FAIL ${spec.id} (${elapsed}ms): ${detail}`);
     }
   }
 }
 
-console.log(`\n==== TOTAL: ${passed} passed, ${failed} failed (${Math.round((passed / (passed + failed)) * 100)}%) ====`);
-if (failures.length) {
+console.log(`\n==== TOTAL: ${successes} passed, ${failures} failed (${Math.round((successes / (successes + failures)) * 100)}%) ====`);
+if (failureLog.length) {
   console.log('\nFailures:');
-  for (const f of failures) console.log(`  - ${f}`);
+  for (const entry of failureLog) console.log(`  - ${entry}`);
 }
-process.exit(failed > 0 ? 1 : 0);
+process.exit(failures > 0 ? 1 : 0);

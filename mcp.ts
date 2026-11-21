@@ -483,7 +483,12 @@ export async function handleMCP(opts: McpRequestOptions): Promise<McpResult> {
             responses.push(rpcError(id, -32601, `Method not found: no handler for '${toolName}'`));
             continue;
           }
-          result = await handler(args, store);
+          const value = await handler(args, store);
+          // MCP tool results carry the payload as a text block plus structured content.
+          result = {
+            content: [{ type: 'text', text: JSON.stringify(value) }],
+            structuredContent: value,
+          };
           break;
         }
         default: {

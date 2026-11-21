@@ -316,16 +316,16 @@ function parseV2Command(packets: readonly GitPacket[]): FetchRequestV2 | null {
     break;
   }
   if (!command.startsWith('command=fetch')) return null;
-  const request: FetchRequestV2 = { wants: [], haves: [], done: true, thinPack: true, noProgress: true };
+  const request: FetchRequestV2 = { wants: [], haves: [], shallow: [], deepenNot: [], done: true, thinPack: true, noProgress: true };
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
     const line = packet.payload.toString('utf8').replace(/\n$/, '');
     if (line.startsWith('want ')) request.wants.push(line.slice(5));
     else if (line.startsWith('have ')) request.haves.push(line.slice(5));
-    else if (line.startsWith('shallow ')) request.shallow?.push(line.slice(8));
+    else if (line.startsWith('shallow ')) request.shallow.push(line.slice(8));
     else if (line.startsWith('deepen ')) request.depth = Number(line.slice(7));
     else if (line.startsWith('deepen-since ')) request.deepenSince = Number(line.slice(13));
-    else if (line.startsWith('deepen-not ')) request.deepenNot?.push(line.slice(11));
+    else if (line.startsWith('deepen-not ')) request.deepenNot.push(line.slice(11));
     else if (line === 'done') request.done = true;
     else if (line === 'thin-pack') request.thinPack = true;
     else if (line === 'no-progress') request.noProgress = true;
@@ -528,11 +528,25 @@ function buildPushReport(report: PushReport, sideband: boolean): Buffer {
     if (ref.ok) lines.push(`ok ${ref.ref}`);
     else lines.push(`ng ${ref.ref} ${ref.reason}`);
   }
-  const text = lines.join('\n') + '\n';
-  if (!sideband) return Buffer.from(text, 'utf8');
-  // Frame as pkt-lines inside band 1
-  const pkt = encodePktLines([text, 'flush']);
-  return Buffer.concat([Buffer.from([1]), pkt]); // band 1
+  lines.push('');
+  const text = lines.join('\n');
+  // The report-status stream is itself pkt-lined ("unpack ok", "ok/ng <ref>", flush).
+  const reportStream = encodePktLines([text, 'flush']);
+  if (!sideband) return reportStream;
+  // side-band-64k: each pkt-line's payload = band byte + a chunk of the report stream.
+  const frames: Buffer[] = [];
+  let offset = 0;
+  const maxChunk = PKT_LINE_MAX_PAYLOAD - 1;
+  while (offset < reportStream.length) {
+    const chunk = reportStream.subarray(offset, Math.min(offset + maxChunk, reportStream.length));
+    offset += chunk.length;
+    const frame = Buffer.allocUnsafe(chunk.length + 1);
+    frame[0] = 1; // band 1 = data
+    chunk.copy(frame, 1);
+    frames.push(encodePktLine(frame));
+  }
+  frames.push(pktLineFlush());
+  return Buffer.concat(frames);
 }
 
 // ---------------------------------------------------------------- public handlers
@@ -656,30 +670,42 @@ export function handleGitRequest(opts: HandlerOptions): HandlerResult {
 
   // GET /info/refs
   if (method === 'GET' && query.get('service') === service) {
-    if (isV2) {
-      const body = buildV2Advertisement(service);
-      return {
-        status: 200,
-        body,
-        contentType: `application/x-${service}-advertisement`,
-        headers: { 'cache-control': 'no-cache' },
-      };
-    } else {
-      const body = buildV0Advertisement(repo, service);
-      return {
-        status: 200,
-        body,
-        contentType: `application/x-${service}-advertisement`,
-        headers: { 'cache-control': 'no-cache' },
-      };
-    }
+    const advertisement = isV2 ? buildV2Advertisement(service) : buildV0Advertisement(repo, service);
+    return {
+      status: 200,
+      body: advertisement,
+      contentType: `application/x-${service}-advertisement`,
+      headers: { 'cache-control': 'no-cache' },
+    };
   }
 
-  // POST /git-upload-pack (fetch)
+  // POST /git-upload-pack (ls-refs or fetch)
   if (method === 'POST' && service === 'git-upload-pack') {
     if (isV2) {
-      // v2 protocol
       const packets = decodePktLines(body);
+      let command = '';
+      for (const packet of packets) {
+        if (packet.kind !== 'data') continue;
+        command = packet.payload.toString('utf8').trim();
+        break;
+      }
+      if (command.startsWith('command=ls-refs')) {
+        const { refs } = handleV2LsRefs(repo, packets);
+        const parts: Buffer[] = [];
+        for (const ref of refs) {
+          let line = `${ref.oid} ${ref.name}`;
+          if (ref.symrefTarget) line += ` symref-target:${ref.symrefTarget}`;
+          if (ref.peeled && ref.peeled !== ref.oid) line += ` peeled:${ref.peeled}`;
+          parts.push(encodePktLine(`${line}\n`));
+        }
+        parts.push(pktLineFlush());
+        return {
+          status: 200,
+          body: Buffer.concat(parts),
+          contentType: `application/x-${service}-result`,
+          headers: { 'cache-control': 'no-cache' },
+        };
+      }
       const request = parseV2Command(packets);
       if (!request) throw new Error('invalid v2 fetch request');
       const result = buildV2FetchResponse(repo, request);
@@ -716,10 +742,10 @@ export function handleGitRequest(opts: HandlerOptions): HandlerResult {
         }
       }
       // Flush after packfile
-      const body = Buffer.concat([encodePktLines(out), ...packFrames, pktLineFlush()]);
+      const responseBody = Buffer.concat([encodePktLines(out), ...packFrames, pktLineFlush()]);
       return {
         status: 200,
-        body,
+        body: responseBody,
         contentType: `application/x-${service}-result`,
         headers: { 'cache-control': 'no-cache' },
       };
@@ -767,13 +793,14 @@ export function handleGitRequest(opts: HandlerOptions): HandlerResult {
 
   // POST /git-receive-pack (push)
   if (method === 'POST' && service === 'git-receive-pack') {
-    // Parse the request body: pkt-lines for commands, then raw pack data
+    // Parse the request body: pkt-lines for commands up to the flush, then RAW pack data.
     const decoder = new PktLineDecoder(body);
     const packets: GitPacket[] = [];
     for (;;) {
       const packet = decoder.next();
       if (packet === null) break;
       packets.push(packet);
+      if (packet.kind === 'flush') break;
     }
     const remainingPack = decoder.takeBuffered();
 

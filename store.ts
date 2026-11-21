@@ -353,7 +353,8 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
 
   for (const entry of raw) {
     const resolved = resolve(entry);
-    if (!objects.has(resolved.oid!)) objects.set(resolved.oid!, { type: resolved.resolvedType!, data: resolved.resolved! });
+    const oid = entry.oid ?? hashObject(entry.resolvedType!, entry.resolved!);
+    if (!objects.has(oid)) objects.set(oid, { type: entry.resolvedType!, data: entry.resolved! });
   }
   return { objects, count: declaredCount };
 }

@@ -62,9 +62,17 @@ function tokenize(input: string): Token[] {
       const startLine = line, startCol = col; let val = ''; while (isNameCont(peek())) { val += peek(); advance(); }
       tokens.push({ type: KEYWORDS.has(val) ? 'NAME' : 'NAME', value: val, line: startLine, col: startCol }); continue;
     }
+    if (c === '.' && peek(1) === '.' && peek(2) === '.') {
+      const startLine = line, startCol = col;
+      advance(3);
+      tokens.push({ type: 'SPREAD', value: '...', line: startLine, col: startCol });
+      continue;
+    }
     if (c === ':' || c === '!' || c === '(' || c === ')' || c === '[' || c === ']' || c === '{' || c === '}' || c === ',' || c === '=' || c === '@' || c === '|' || c === '&') {
-      const startLine = line, startCol = col; let val = c; advance(); if (c === '.' && peek() === '.' && input[i + 1] === '.') { val = '...'; advance(3); tokens.push({ type: 'SPREAD', value: '...', line: startLine, col: startCol }); continue; }
-      tokens.push({ type: 'PUNCTUATION', value: val, line: startLine, col: startCol }); continue;
+      const startLine = line, startCol = col; let val = c;
+      advance();
+      tokens.push({ type: 'PUNCTUATION', value: val, line: startLine, col: startCol });
+      continue;
     }
     throw new Error(`Unexpected character ${c} at ${line}:${col}`);
   }
@@ -124,8 +132,8 @@ function createParser(tokens: Token[]): Parser {
       if (tok.value === 'null') { eat('NAME'); return { kind: 'NullValue' }; }
       eat('NAME'); return { kind: 'EnumValue', value: tok.value };
     }
-    if (tok.type === 'PUNCTUATION' && tok.value === '[') { eat('PUNCTUATION', '['); const vals: ValueNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== ']') vals.push(parseValue()); eat('PUNCTUATION', ']'); return { kind: 'ListValue', values: vals }; }
-    if (tok.type === 'PUNCTUATION' && tok.value === '{') { eat('PUNCTUATION', '{'); const fields: ObjectFieldNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== '}') { const name = expect('NAME').value; eat('PUNCTUATION', ':'); fields.push({ kind: 'ObjectField', name, value: parseValue() }); } eat('PUNCTUATION', '}'); return { kind: 'ObjectValue', fields }; }
+    if (tok.type === 'PUNCTUATION' && tok.value === '[') { eat('PUNCTUATION', '['); const vals: ValueNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== ']') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } vals.push(parseValue()); } eat('PUNCTUATION', ']'); return { kind: 'ListValue', values: vals }; }
+    if (tok.type === 'PUNCTUATION' && tok.value === '{') { eat('PUNCTUATION', '{'); const fields: ObjectFieldNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== '}') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } const name = expect('NAME').value; eat('PUNCTUATION', ':'); fields.push({ kind: 'ObjectField', name, value: parseValue() }); } eat('PUNCTUATION', '}'); return { kind: 'ObjectValue', fields }; }
     throw new Error(`Unexpected value token ${tok.type} ${tok.value} at ${tok.line}:${tok.col}`);
   };
   const parseArgument = (): ArgumentNode => { const name = expect('NAME').value; eat('PUNCTUATION', ':'); return { kind: 'Argument', name, value: parseValue() }; };
@@ -140,9 +148,9 @@ function createParser(tokens: Token[]): Parser {
     if (peek().type === 'PUNCTUATION' && peek().value === '{') { eat('PUNCTUATION', '{'); selectionSet = parseSelectionSet(); eat('PUNCTUATION', '}'); }
     return { kind: 'Field', alias, name, arguments: args, directives: dirs, selectionSet };
   };
-  const parseSelectionSet = (): SelectionNode[] => { const sels: SelectionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== '}') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } if (peek().type === 'PUNCTUATION' && peek().value === '...') { const tok = peek(1); if (tok.type === 'NAME' && tok.value === 'on') { sels.push(parseInlineFragment()); } else { sels.push(parseFragmentSpread()); } } else { sels.push(parseField()); } } return sels; };
+  const parseSelectionSet = (): SelectionNode[] => { const sels: SelectionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== '}') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } if (peek().type === 'SPREAD') { const tok = peek(1); if (tok.type === 'NAME' && tok.value === 'on') { sels.push(parseInlineFragment()); } else { sels.push(parseFragmentSpread()); } } else { sels.push(parseField()); } } return sels; };
   const parseFragmentSpread = (): FragmentSpreadNode => { eat('SPREAD'); const name = expect('NAME').value; return { kind: 'FragmentSpread', name, directives: parseDirectives() }; };
-  const parseInlineFragment = (): InlineFragmentNode => { eat('SPREAD'); eat('NAME', 'on'); const typeCondition = expect('NAME').value; return { kind: 'InlineFragment', typeCondition, directives: parseDirectives(), selectionSet: parseSelectionSet() }; };
+  const parseInlineFragment = (): InlineFragmentNode => { eat('SPREAD'); eat('NAME', 'on'); const typeCondition = expect('NAME').value; eat('PUNCTUATION', '{'); const selectionSet = parseSelectionSet(); eat('PUNCTUATION', '}'); return { kind: 'InlineFragment', typeCondition, directives: parseDirectives(), selectionSet }; };
   const parseVariableDefinition = (): VariableDefinitionNode => { const name = expect('VARIABLE').value; eat('PUNCTUATION', ':'); const type = parseType(); let defaultValue: ValueNode | undefined; if (peek().type === 'PUNCTUATION' && peek().value === '=') { eat('PUNCTUATION', '='); defaultValue = parseValue(); } return { kind: 'VariableDefinition', name, type, defaultValue, directives: [] }; };
   const parseVariableDefinitions = (): VariableDefinitionNode[] => { if (peek().type !== 'PUNCTUATION' || peek().value !== '(') return []; eat('PUNCTUATION', '('); const defs: VariableDefinitionNode[] = []; while (peek().type !== 'PUNCTUATION' || peek().value !== ')') { if (peek().type === 'PUNCTUATION' && peek().value === ',') { eat('PUNCTUATION', ','); continue; } defs.push(parseVariableDefinition()); } eat('PUNCTUATION', ')'); return defs; };
   const parseOperation = (): OperationDefinitionNode => {

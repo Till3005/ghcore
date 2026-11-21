@@ -2,7 +2,8 @@
 # Run the forge + smoke test in one shot, then shut down.
 set -u
 cd "$(dirname "$0")"
-pkill -f "FORGE_UNDER_TEST" 2>/dev/null
+lsof -ti:41234 2>/dev/null | xargs kill -9 2>/dev/null
+sleep 0.3
 MAKEFUN_ENV_URL=http://localhost:8080 MAKEFUN_SHOP_TOKEN=test-token FORGE_UNDER_TEST=1 node --experimental-strip-types -e "
 import { createApp } from './app.ts';
 const server = createApp();
